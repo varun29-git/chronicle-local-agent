@@ -19,6 +19,7 @@ DEFAULT_DAYS = 7
 DEFAULT_QUERIES = 4
 DEFAULT_RESULTS_PER_QUERY = 3
 MAX_ARTICLE_CHARS = 8000
+DEFAULT_WRITING_STYLE = "Sharp, analytical, and premium. Write like a high-end newsletter editor, not a corporate content bot."
 SSL_WARNING_SHOWN = False
 
 print("Loading newsletter brain into RAM")
@@ -52,9 +53,12 @@ def main():
 def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_dir):
     plan = build_research_plan(brief, days, query_limit)
     run_id = save_run(plan, brief)
+    market_snapshot = fetch_market_snapshot(brief)
 
     print("\nPlanning complete.")
     print(f"Title: {plan['title']}")
+    if market_snapshot:
+        print(f"Structured market data collected for {len(market_snapshot)} assets.")
 
     collected_sources = []
     for query in plan["queries"]:
@@ -94,7 +98,13 @@ def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_
             "The search provider may be blocking requests or the network may still be failing."
         )
 
-    newsletter_markdown = compose_newsletter(brief, plan, collected_sources, days)
+    newsletter_markdown = compose_newsletter(
+        brief,
+        plan,
+        collected_sources,
+        days,
+        market_snapshot,
+    )
     output_path = write_newsletter_file(output_dir, plan["title"], newsletter_markdown)
     update_run_output_path(run_id, output_path)
 
@@ -143,10 +153,58 @@ Rules:
     return {
         "title": str(plan.get("title", "")).strip() or "Weekly Newsletter",
         "audience": str(plan.get("audience", "")).strip() or "General readers",
-        "tone": str(plan.get("tone", "")).strip() or "Clear and conversational",
+        "tone": str(plan.get("tone", "")).strip() or DEFAULT_WRITING_STYLE,
         "queries": queries[:query_limit],
         "sections": sections,
     }
+
+
+def fetch_market_snapshot(brief):
+    if not looks_like_crypto_brief(brief):
+        return []
+
+    url = (
+        "https://api.coingecko.com/api/v3/coins/markets"
+        "?vs_currency=usd&order=market_cap_desc&per_page=5&page=1"
+        "&sparkline=false&price_change_percentage=7d"
+    )
+
+    try:
+        payload = fetch_url(url)
+        data = json.loads(payload)
+    except Exception as exc:
+        print(f"Structured market data fetch failed: {exc}")
+        return []
+
+    snapshot = []
+    for item in data[:5]:
+        snapshot.append(
+            {
+                "name": item.get("name", ""),
+                "symbol": str(item.get("symbol", "")).upper(),
+                "price_usd": item.get("current_price"),
+                "market_cap_rank": item.get("market_cap_rank"),
+                "change_24h_pct": item.get("price_change_percentage_24h"),
+                "change_7d_pct": item.get("price_change_percentage_7d_in_currency"),
+            }
+        )
+
+    return snapshot
+
+
+def looks_like_crypto_brief(brief):
+    lowered = brief.lower()
+    keywords = (
+        "crypto",
+        "bitcoin",
+        "ethereum",
+        "blockchain",
+        "defi",
+        "token",
+        "altcoin",
+        "web3",
+    )
+    return any(keyword in lowered for keyword in keywords)
 
 
 def search_web(query, max_results):
@@ -311,7 +369,7 @@ Rules:
     }
 
 
-def compose_newsletter(brief, plan, collected_sources, days):
+def compose_newsletter(brief, plan, collected_sources, days, market_snapshot):
     compact_sources = []
     for index, source in enumerate(collected_sources, start=1):
         compact_sources.append(
@@ -324,10 +382,12 @@ def compose_newsletter(brief, plan, collected_sources, days):
             }
         )
 
+    market_data_block = json.dumps(market_snapshot, ensure_ascii=True)
+
     prompt = f"""<start_of_turn>user
 You are the writing brain for a newsletter agent.
 
-Write a complete markdown newsletter using only the source summaries provided.
+Write a complete markdown newsletter using the structured market data and source summaries provided.
 
 Newsletter brief:
 "{brief}"
@@ -341,23 +401,35 @@ Audience:
 Tone:
 "{plan['tone']}"
 
+House style:
+"{DEFAULT_WRITING_STYLE}"
+
 Coverage window:
 Last {days} days
 
 Planned sections:
 {json.dumps(plan['sections'])}
 
+Structured market data:
+{market_data_block}
+
 Source summaries:
 {json.dumps(compact_sources, ensure_ascii=True)}
 
 Requirements:
 - write a strong headline
-- include a short opening note
+- include a short opening note with a point of view
 - organize the body around the planned sections
-- make it readable and conversational
+- make it readable, analytical, and confident
+- do not sound generic, padded, or corporate
+- make at least one concrete interpretation about what mattered most this week
 - use inline citations like [1], [2]
+- if structured market data is present, cite it as [M1]
+- if structured market data is provided, use the exact percentage moves and prices from it instead of vague descriptions
+- when you mention top market movers, include the actual numbers such as 24h or 7d percentage moves
 - end with a short closing note
 - include a final Sources section listing [id]: title - url
+- if structured market data is present, add: [M1]: CoinGecko Markets API - https://www.coingecko.com/
 - return markdown only
 <end_of_turn>
 <start_of_turn>model
