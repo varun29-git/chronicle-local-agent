@@ -4,7 +4,9 @@ import json
 import os
 import re
 import sqlite3
+import ssl
 import urllib.parse
+import urllib.error
 import urllib.request
 from datetime import datetime
 
@@ -17,6 +19,7 @@ DEFAULT_DAYS = 7
 DEFAULT_QUERIES = 4
 DEFAULT_RESULTS_PER_QUERY = 3
 MAX_ARTICLE_CHARS = 8000
+SSL_WARNING_SHOWN = False
 
 print("Loading newsletter brain into RAM")
 model, tokenizer = load(MODEL_PATH)
@@ -57,6 +60,9 @@ def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_
     for query in plan["queries"]:
         print(f"\nSearching: {query}")
         results = search_web(query, results_per_query)
+        if not results:
+            print("  No search results collected for this query.")
+            continue
         for rank, result in enumerate(results, start=1):
             article_text = fetch_article_text(result["url"])
             if not article_text:
@@ -78,7 +84,10 @@ def run_newsletter_pipeline(brief, days, query_limit, results_per_query, output_
             print(f"  Saved source: {result['title']}")
 
     if not collected_sources:
-        raise RuntimeError("No usable sources were collected from the web search step")
+        raise RuntimeError(
+            "No usable sources were collected from the web search step. "
+            "The search provider may be blocking requests or the network may still be failing."
+        )
 
     newsletter_markdown = compose_newsletter(brief, plan, collected_sources, days)
     output_path = write_newsletter_file(output_dir, plan["title"], newsletter_markdown)
@@ -132,7 +141,11 @@ Rules:
 
 def search_web(query, max_results):
     url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-    html_text = fetch_url(url)
+    try:
+        html_text = fetch_url(url)
+    except Exception as exc:
+        print(f"  Search fetch failed: {exc}")
+        return []
     matches = re.findall(
         r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
         html_text,
@@ -181,6 +194,8 @@ def normalize_result_url(href):
 
 
 def fetch_url(url):
+    global SSL_WARNING_SHOWN
+
     request = urllib.request.Request(
         url,
         headers={
@@ -190,8 +205,31 @@ def fetch_url(url):
             )
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+
+    try:
+        return read_response(request)
+    except urllib.error.URLError as exc:
+        if not is_certificate_error(exc):
+            raise
+
+        if not SSL_WARNING_SHOWN:
+            print("  SSL verification failed. Retrying with insecure SSL fallback.")
+            SSL_WARNING_SHOWN = True
+
+        insecure_context = ssl._create_unverified_context()
+        return read_response(request, insecure_context)
+
+
+def read_response(request, context=None):
+    with urllib.request.urlopen(request, timeout=20, context=context) as response:
         return response.read().decode("utf-8", errors="ignore")
+
+
+def is_certificate_error(exc):
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    return "CERTIFICATE_VERIFY_FAILED" in str(exc)
 
 
 def fetch_article_text(url):
