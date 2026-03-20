@@ -997,11 +997,18 @@ def compose_newsletter(
         explanation_style,
         custom_style_instructions,
     )
+    editorial_brief = build_editorial_brief(
+        brief,
+        plan,
+        compact_sources,
+        market_snapshot,
+        depth,
+    )
 
     prompt = f"""<start_of_turn>user
 You are the writing brain for a newsletter agent.
 
-Write a complete markdown newsletter using the structured market data and source summaries provided.
+Write a complete markdown newsletter using the structured market data, editorial brief, and source summaries provided.
 
 Newsletter brief:
 "{brief}"
@@ -1033,6 +1040,9 @@ Research depth:
 Planned sections:
 {json.dumps(plan['sections'])}
 
+Editorial brief:
+{json.dumps(editorial_brief, ensure_ascii=True)}
+
 Structured market data:
 {market_data_block}
 
@@ -1045,7 +1055,13 @@ Requirements:
 - organize the body around the planned sections
 - make it readable, analytical, and confident
 - do not sound generic, padded, or corporate
+- do not merely aggregate events; synthesize them into a sharp argument
+- prove the thesis aggressively instead of hinting at it
+- surface the hidden pattern the average reader would miss
 - make at least one concrete interpretation about what mattered most this week
+- include one killer insight that makes the reader rethink the topic
+- prefer sharp-smart over safe-smart
+- avoid consultant language, hedging, and empty acceleration talk
 - follow the explanation guidance exactly
 - if depth is low, keep it crisp and selective
 - if depth is medium, balance signal and concision
@@ -1063,6 +1079,68 @@ Requirements:
 """
 
     return generate_text_from_prompt(prompt, newsletter_tokens).strip()
+
+
+def build_editorial_brief(brief, plan, compact_sources, market_snapshot, depth):
+    prompt = f"""<start_of_turn>user
+You are the editorial strategist for a premium newsletter.
+
+Your job is to transform raw source summaries into a sharp point of view before drafting begins.
+
+Newsletter brief:
+"{brief}"
+
+Audience:
+"{plan['audience']}"
+
+Tone:
+"{plan['tone']}"
+
+Depth:
+{depth}
+
+Planned sections:
+{json.dumps(plan['sections'])}
+
+Structured market data:
+{json.dumps(market_snapshot, ensure_ascii=True)}
+
+Source summaries:
+{json.dumps(compact_sources, ensure_ascii=True)}
+
+Return ONLY JSON in this format:
+{{"core_thesis":"str","hidden_pattern":"str","killer_insight":"str","contrarian_take":"str","proof_points":["p1","p2","p3"]}}
+
+Rules:
+- the thesis must be explicit and defensible
+- the hidden pattern must go beyond restating events
+- the killer insight should feel memorable and surprising
+- the contrarian take should sharpen the voice without becoming fake or sensational
+- proof_points should be concrete claims the final newsletter should prove
+- do not include any text outside JSON
+<end_of_turn>
+<start_of_turn>model
+{{"core_thesis":"""
+
+    try:
+        return generate_json_from_prompt(
+            prompt,
+            '{"core_thesis":',
+            220,
+            schema_hint='{"core_thesis":"str","hidden_pattern":"str","killer_insight":"str","contrarian_take":"str","proof_points":["p1","p2","p3"]}',
+        )
+    except Exception:
+        return {
+            "core_thesis": "This week was not just busy; it showed a clearer strategic direction in the field.",
+            "hidden_pattern": "Parallel progress across multiple fronts usually matters more than any single headline.",
+            "killer_insight": "When separate parts of an industry start solving adjacent bottlenecks at once, the story shifts from isolated progress to ecosystem readiness.",
+            "contrarian_take": "The real signal is not hype volume but whether different constraints are easing at the same time.",
+            "proof_points": [
+                "Multiple sources point to simultaneous progress rather than one-off noise.",
+                "The most important development is the change in system-level readiness.",
+                "Readers should come away with a sharper frame, not just a recap.",
+            ],
+        }
 
 
 def generate_json_from_prompt(prompt, prefill, max_tokens, schema_hint=None, retries=2):
