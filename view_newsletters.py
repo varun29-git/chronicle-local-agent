@@ -9,7 +9,7 @@ def display_runs():
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT id, title, depth, created_at, output_path
+        SELECT id, title, depth, explanation_style, created_at, output_path
         FROM newsletter_runs
         ORDER BY id DESC
         """
@@ -18,10 +18,10 @@ def display_runs():
     conn.close()
 
     print("\n--- NEWSLETTER RUNS ---")
-    print(f"{'ID':<4} | {'Title':<32} | {'Depth':<8} | {'Created At':<20} | {'Output Path'}")
-    print("-" * 108)
+    print(f"{'ID':<4} | {'Title':<28} | {'Depth':<8} | {'Style':<10} | {'Created At':<20} | {'Output Path'}")
+    print("-" * 122)
     for row in rows:
-        print(f"{row[0]:<4} | {row[1][:32]:<32} | {(row[2] or ''):<8} | {row[3]:<20} | {row[4] or ''}")
+        print(f"{row[0]:<4} | {row[1][:28]:<28} | {(row[2] or ''):<8} | {(row[3] or ''):<10} | {row[4]:<20} | {row[5] or ''}")
 
 
 if __name__ == "__main__":
