@@ -33,7 +33,7 @@ SLICE_MODEL_PATHS = {
 EXPLANATION_STYLE_GUIDANCE = {
     "concise": "Explain ideas briefly and cleanly. Prioritize compression, signal, and fast readability.",
     "feynman": "Explain ideas simply and clearly, as if teaching an intelligent beginner. Break down jargon into plain language without sounding childish.",
-    "soc": "Reveal the reasoning path in a lightweight way. Show how one point leads to the next, using a reflective and exploratory style without becoming rambling.",
+    "soc": "Explain in a Socratic style. Lead the reader through the idea by posing and answering the right questions step by step, while staying concise and clear.",
 }
 DEPTH_PRESETS = {
     "low": {
@@ -496,29 +496,19 @@ def detect_device_class(system_info, device_class_override=None):
 def choose_slice_ratio(device_class, system_info):
     available_gb = system_info.get("memory_available_gb", 0.0) or 0.0
     reserve_gb = max(DEFAULT_RAM_RESERVE_GB, 1.0)
+    headroom_gb = max(available_gb - reserve_gb, 0.0) if available_gb else 0.0
 
-    if device_class == "midrange_phone":
-        return 0.125
-    if device_class == "flagship_phone":
+    if not available_gb:
         return 0.25
-    if device_class == "midrange_laptop":
-        if available_gb and available_gb <= reserve_gb + 2:
-            return 0.25
+    if headroom_gb <= 2:
+        return 0.125
+    if headroom_gb <= 4:
+        return 0.25
+    if headroom_gb <= 8:
         return 0.50
-    if device_class == "macbook":
-        if available_gb and available_gb <= reserve_gb + 2:
-            return 0.25
-        if available_gb and available_gb <= reserve_gb + 4:
-            return 0.50
+    if headroom_gb <= 12:
         return 0.75
-    if device_class == "gaming_laptop":
-        if available_gb and available_gb <= reserve_gb + 3:
-            return 0.50
-        if available_gb and available_gb <= reserve_gb + 6:
-            return 0.75
-        return 1.00
-
-    return 0.25
+    return 1.00
 
 
 def choose_runtime_backend(device_class, system_info):
