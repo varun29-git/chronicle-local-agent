@@ -15,10 +15,27 @@ from datetime import datetime
 
 from newsletter_schema import DB_PATH, initialize_database
 
-DEFAULT_MLX_MODEL_PATH = "mlx-community/gemma-3-4b-it-4bit"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL_ROOT = os.environ.get(
+    "NEWSLETTER_AGENT_MODEL_ROOT",
+    os.path.join(PROJECT_ROOT, "models"),
+)
+DEFAULT_MLX_MODEL_REPO = "mlx-community/gemma-3-4b-it-4bit"
+DEFAULT_TRANSFORMERS_MODEL_REPO = "google/gemma-2-2b-it"
+DEFAULT_LOCAL_MLX_MODEL_PATH = os.path.join(
+    DEFAULT_MODEL_ROOT,
+    "mlx-community",
+    "gemma-3-4b-it-4bit",
+)
+DEFAULT_LOCAL_TRANSFORMERS_MODEL_PATH = os.path.join(
+    DEFAULT_MODEL_ROOT,
+    "google",
+    "gemma-2-2b-it",
+)
+DEFAULT_MLX_MODEL_PATH = DEFAULT_LOCAL_MLX_MODEL_PATH
 DEFAULT_TRANSFORMERS_MODEL_PATH = os.environ.get(
     "NEWSLETTER_AGENT_MODEL_TRANSFORMERS",
-    os.environ.get("NEWSLETTER_AGENT_MODEL", "google/gemma-2-2b-it"),
+    os.environ.get("NEWSLETTER_AGENT_MODEL", DEFAULT_LOCAL_TRANSFORMERS_MODEL_PATH),
 )
 DEFAULT_MODEL_PATH = os.environ.get("NEWSLETTER_AGENT_MODEL", DEFAULT_MLX_MODEL_PATH)
 DEFAULT_DAYS = 7
@@ -189,16 +206,18 @@ def initialize_mlx_runtime(system_info, runtime_profile):
         ) from exc
 
     print("Loading newsletter brain into RAM")
+    model_path = ensure_model_path_ready(runtime_profile["model_path"], "mlx")
     model, tokenizer = mlx_load(
-        runtime_profile["model_path"],
+        model_path,
         lazy=runtime_profile["lazy"],
     )
 
     draft_model = None
     if runtime_profile["draft_model_path"]:
         try:
-            draft_model, _ = mlx_load(runtime_profile["draft_model_path"], lazy=True)
-            print(f"Loaded draft model: {runtime_profile['draft_model_path']}")
+            draft_model_path = normalize_model_reference(runtime_profile["draft_model_path"])
+            draft_model, _ = mlx_load(draft_model_path, lazy=True)
+            print(f"Loaded draft model: {draft_model_path}")
         except Exception as exc:
             print(f"Draft model load failed, continuing without it: {exc}")
 
@@ -227,20 +246,21 @@ def initialize_transformers_runtime(runtime_profile):
     dtype = choose_transformers_dtype(torch, device)
     print("Loading newsletter brain into RAM")
 
-    tokenizer = AutoTokenizer.from_pretrained(runtime_profile["model_path"])
+    model_path = ensure_model_path_ready(runtime_profile["model_path"], "transformers")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     model_kwargs = {}
     if dtype is not None:
         model_kwargs["torch_dtype"] = dtype
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
-            runtime_profile["model_path"],
+            model_path,
             low_cpu_mem_usage=True,
             **model_kwargs,
         )
     except TypeError:
         model = AutoModelForCausalLM.from_pretrained(
-            runtime_profile["model_path"],
+            model_path,
             **model_kwargs,
         )
 
@@ -618,13 +638,80 @@ def choose_model_path_for_slice(slice_ratio, default_path):
 
 
 def resolve_model_path_for_backend(model_path, runtime_backend):
+    normalized_model_path = normalize_model_reference(model_path)
+
     if runtime_backend == "mlx":
-        return model_path
+        return normalized_model_path
 
     if str(model_path).startswith("mlx-community/"):
-        return DEFAULT_TRANSFORMERS_MODEL_PATH
+        return normalize_model_reference(DEFAULT_TRANSFORMERS_MODEL_PATH)
+
+    if normalized_model_path == normalize_model_reference(DEFAULT_LOCAL_MLX_MODEL_PATH):
+        return normalize_model_reference(DEFAULT_TRANSFORMERS_MODEL_PATH)
+
+    return normalized_model_path
+
+
+def normalize_model_reference(model_path):
+    model_path = str(model_path).strip()
+    if not model_path:
+        return model_path
+
+    if is_local_model_reference(model_path):
+        expanded_path = os.path.expanduser(model_path)
+        if os.path.isabs(expanded_path):
+            return os.path.normpath(expanded_path)
+        return os.path.normpath(os.path.join(PROJECT_ROOT, expanded_path))
 
     return model_path
+
+
+def is_local_model_reference(model_path):
+    model_path = str(model_path).strip()
+    if not model_path:
+        return False
+
+    expanded_path = os.path.expanduser(model_path)
+    normalized_path = model_path.replace("\\", "/")
+    if os.path.isabs(expanded_path):
+        return True
+    if normalized_path.startswith(("./", "../", "~/", "models/")):
+        return True
+    return os.path.exists(os.path.join(PROJECT_ROOT, expanded_path))
+
+
+def ensure_model_path_ready(model_path, runtime_backend):
+    normalized_model_path = normalize_model_reference(model_path)
+    if not is_local_model_reference(normalized_model_path):
+        return normalized_model_path
+
+    if os.path.exists(normalized_model_path):
+        return normalized_model_path
+
+    raise SystemExit(build_missing_local_model_message(runtime_backend, normalized_model_path))
+
+
+def build_missing_local_model_message(runtime_backend, model_path):
+    if runtime_backend == "mlx":
+        expected_default_path = DEFAULT_LOCAL_MLX_MODEL_PATH
+        default_repo = DEFAULT_MLX_MODEL_REPO
+        override_hint = "NEWSLETTER_AGENT_MODEL or NEWSLETTER_AGENT_MODEL_SLICE_*"
+    else:
+        expected_default_path = DEFAULT_LOCAL_TRANSFORMERS_MODEL_PATH
+        default_repo = DEFAULT_TRANSFORMERS_MODEL_REPO
+        override_hint = "NEWSLETTER_AGENT_MODEL_TRANSFORMERS or NEWSLETTER_AGENT_MODEL"
+
+    return (
+        "Local model files not found.\n"
+        f"Expected model directory: {model_path}\n"
+        "This project now defaults to local model directories so end users do not need "
+        "Hugging Face tokens.\n"
+        "To fix this:\n"
+        f"  1. Place the model files at: {expected_default_path}\n"
+        f"  2. Or point {override_hint} to a local model directory\n"
+        f"  3. If you intentionally want Hugging Face downloads, set the override to a hub "
+        f"model id such as {default_repo} after authenticating for gated access"
+    )
 
 
 def format_slice_label(slice_ratio):

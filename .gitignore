@@ -4,3 +4,4 @@ venv/
 __pycache__/
 newsletter_agent.db
 output/
+models/
