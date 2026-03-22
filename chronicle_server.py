@@ -59,39 +59,10 @@ class ChronicleHandler(BaseHTTPRequestHandler):
     server_version = "ChronicleHTTP/1.0"
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
+        return self.dispatch_request(send_body=True)
 
-        if path == "/" or path == "/index.html":
-            return self.serve_file(FRONTEND_ROOT / "index.html", "text/html; charset=utf-8")
-
-        if path.startswith("/static/"):
-            relative_path = path.removeprefix("/static/")
-            return self.serve_safe_path(STATIC_ROOT, relative_path)
-
-        if path.startswith("/newsletters/"):
-            relative_path = path.removeprefix("/newsletters/")
-            return self.serve_safe_path(OUTPUT_ROOT, relative_path)
-
-        if path == "/api/status":
-            return self.send_json(build_status_payload())
-
-        if path == "/api/runs":
-            query = parse_qs(parsed.query)
-            try:
-                limit = max(1, min(int(query.get("limit", ["24"])[0]), 60))
-            except ValueError:
-                limit = 24
-            return self.send_json({"runs": fetch_runs(limit=limit)})
-
-        if path.startswith("/api/jobs/"):
-            job_id = path.removeprefix("/api/jobs/").strip()
-            job = get_job(job_id)
-            if not job:
-                return self.send_json({"error": "Job not found"}, status=HTTPStatus.NOT_FOUND)
-            return self.send_json({"job": job})
-
-        return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+    def do_HEAD(self):
+        return self.dispatch_request(send_body=False)
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -117,6 +88,49 @@ class ChronicleHandler(BaseHTTPRequestHandler):
     def log_message(self, format_string, *args):
         return
 
+    def dispatch_request(self, send_body):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/" or path == "/index.html":
+            return self.serve_file(
+                FRONTEND_ROOT / "index.html",
+                "text/html; charset=utf-8",
+                send_body=send_body,
+            )
+
+        if path.startswith("/static/"):
+            relative_path = path.removeprefix("/static/")
+            return self.serve_safe_path(STATIC_ROOT, relative_path, send_body=send_body)
+
+        if path.startswith("/newsletters/"):
+            relative_path = path.removeprefix("/newsletters/")
+            return self.serve_safe_path(OUTPUT_ROOT, relative_path, send_body=send_body)
+
+        if path == "/api/status":
+            return self.send_json(build_status_payload(), send_body=send_body)
+
+        if path == "/api/runs":
+            query = parse_qs(parsed.query)
+            try:
+                limit = max(1, min(int(query.get("limit", ["24"])[0]), 60))
+            except ValueError:
+                limit = 24
+            return self.send_json({"runs": fetch_runs(limit=limit)}, send_body=send_body)
+
+        if path.startswith("/api/jobs/"):
+            job_id = path.removeprefix("/api/jobs/").strip()
+            job = get_job(job_id)
+            if not job:
+                return self.send_json(
+                    {"error": "Job not found"},
+                    status=HTTPStatus.NOT_FOUND,
+                    send_body=send_body,
+                )
+            return self.send_json({"job": job}, send_body=send_body)
+
+        return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND, send_body=send_body)
+
     def read_json_body(self):
         content_length = self.headers.get("Content-Length", "0").strip()
         try:
@@ -133,28 +147,29 @@ class ChronicleHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return None
 
-    def send_json(self, payload, status=HTTPStatus.OK):
+    def send_json(self, payload, status=HTTPStatus.OK, send_body=True):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if send_body:
+            self.wfile.write(body)
 
-    def serve_safe_path(self, base_root, relative_path):
+    def serve_safe_path(self, base_root, relative_path, send_body=True):
         candidate_path = (base_root / relative_path).resolve()
         base_root = base_root.resolve()
         if base_root not in candidate_path.parents and candidate_path != base_root:
-            return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND, send_body=send_body)
         if not candidate_path.exists() or not candidate_path.is_file():
-            return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
-        return self.serve_file(candidate_path)
+            return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND, send_body=send_body)
+        return self.serve_file(candidate_path, send_body=send_body)
 
-    def serve_file(self, file_path, content_type=None):
+    def serve_file(self, file_path, content_type=None, send_body=True):
         try:
             content = file_path.read_bytes()
         except FileNotFoundError:
-            return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
+            return self.send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND, send_body=send_body)
 
         guessed_type = content_type
         if guessed_type is None:
@@ -165,7 +180,8 @@ class ChronicleHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", guessed_type)
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
-        self.wfile.write(content)
+        if send_body:
+            self.wfile.write(content)
 
 
 def normalize_generation_payload(payload):
