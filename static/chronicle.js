@@ -133,22 +133,34 @@ async function hydrateApp() {
 }
 
 function renderRuntime(runtime) {
-  const ready = Boolean(runtime.model_ready);
-  elements.runtimeBadge.textContent = ready ? "Model ready" : "Model missing";
-  elements.runtimeBadge.classList.toggle("is-warm", !ready);
+  const dependenciesReady = Boolean(runtime.dependencies_ready);
+  const modelReady = Boolean(runtime.model_ready);
+  if (!dependenciesReady) {
+    setBadge(elements.runtimeBadge, "Deps missing", "is-danger");
+  } else if (!modelReady) {
+    setBadge(elements.runtimeBadge, "Model missing", "is-warm");
+  } else {
+    setBadge(elements.runtimeBadge, "Ready", "");
+  }
   elements.runtimeHeadline.textContent =
     `Chronicle is using ${runtime.hostname} as the newsroom engine.`;
-  elements.runtimeSubline.textContent =
-    ready
-      ? "The runtime is pointed at a local model path, so the issue generation pipeline can stay on-device."
-      : "The site is live, but the local model path is missing. Chronicle will stay local-first once the model directory is placed on this machine.";
+  if (!dependenciesReady) {
+    elements.runtimeSubline.textContent =
+      `${runtime.dependency_message}. Start Chronicle with the correct local runtime environment on this machine before generating issues.`;
+  } else if (!modelReady) {
+    elements.runtimeSubline.textContent =
+      "The site is live, but the local model path is missing. Chronicle will stay local-first once the model directory is placed on this machine.";
+  } else {
+    elements.runtimeSubline.textContent =
+      "The runtime is pointed at a local model path, so the issue generation pipeline can stay on-device.";
+  }
 
   elements.statBackend.textContent = upper(runtime.runtime_backend);
   elements.statSlice.textContent = runtime.slice_label || "—";
   elements.statMemory.textContent = runtime.memory_total_gb
     ? `${runtime.memory_total_gb.toFixed(1)} GB`
     : "Unknown";
-  elements.statModelReady.textContent = ready ? "Ready" : "Missing";
+  elements.statModelReady.textContent = modelReady ? "Ready" : "Missing";
 
   elements.detailHostname.textContent = runtime.hostname || "This device";
   elements.detailPlatform.textContent = [

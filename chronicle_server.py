@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import traceback
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -256,6 +256,7 @@ def build_runtime_snapshot():
     model_path = newsletter_agent.normalize_model_reference(runtime_profile["model_path"])
     local_model = newsletter_agent.is_local_model_reference(model_path)
     model_ready = os.path.exists(model_path) if local_model else False
+    dependencies_ready, dependency_message = detect_runtime_dependencies(runtime_profile["runtime_backend"])
 
     return {
         "hostname": platform.node() or "This device",
@@ -273,9 +274,25 @@ def build_runtime_snapshot():
         "model_path": model_path,
         "model_local": local_model,
         "model_ready": model_ready,
+        "dependencies_ready": dependencies_ready,
+        "dependency_message": dependency_message,
         "local_model_root": str(Path(newsletter_agent.DEFAULT_MODEL_ROOT).resolve()),
         "output_directory": str(OUTPUT_ROOT.resolve()),
     }
+
+
+def detect_runtime_dependencies(runtime_backend):
+    try:
+        if runtime_backend == "mlx":
+            import mlx_lm  # noqa: F401
+            return True, "mlx_lm available"
+        if runtime_backend == "transformers":
+            import torch  # noqa: F401
+            import transformers  # noqa: F401
+            return True, "torch and transformers available"
+    except ModuleNotFoundError as exc:
+        return False, f"Missing dependency: {exc.name}"
+    return False, "Unsupported runtime backend"
 
 
 def create_generation_job(payload):
@@ -289,8 +306,8 @@ def create_generation_job(payload):
             "id": job_id,
             "status": "queued",
             "message": "Queued on this device",
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "params": payload,
             "result": None,
             "error": None,
@@ -360,7 +377,7 @@ def update_job(job_id, **changes):
         if not job:
             return None
         job.update(changes)
-        job["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        job["updated_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         return dict(job)
 
 
