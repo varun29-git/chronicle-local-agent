@@ -20,7 +20,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 FRONTEND_ROOT = PROJECT_ROOT / "frontend"
 STATIC_ROOT = PROJECT_ROOT / "static"
 OUTPUT_ROOT = PROJECT_ROOT / "output" / "newsletters"
-MODELS_ROOT = Path(newsletter_agent.DEFAULT_MODEL_ROOT)
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -45,7 +44,6 @@ def main():
 
     initialize_database()
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    MODELS_ROOT.mkdir(parents=True, exist_ok=True)
 
     server = ThreadingHTTPServer((args.host, args.port), ChronicleHandler)
     print(f"Chronicle running at http://{args.host}:{args.port}")
@@ -137,10 +135,6 @@ class ChronicleHandler(BaseHTTPRequestHandler):
         if path.startswith("/newsletters/"):
             relative_path = path.removeprefix("/newsletters/")
             return self.serve_safe_path(OUTPUT_ROOT, relative_path, send_body=send_body)
-
-        if path.startswith("/models/"):
-            relative_path = path.removeprefix("/models/")
-            return self.serve_safe_path(MODELS_ROOT.resolve(), relative_path, send_body=send_body)
 
         if path == "/api/status":
             return self.send_json(build_status_payload(), send_body=send_body)
@@ -322,7 +316,9 @@ def build_browser_ai_snapshot():
         "provider": "@huggingface/transformers",
         "preferred_backend": "webgpu",
         "fallback_backend": "wasm",
-        "model": "gemma-3-it",
+        "high_tier_model": "onnx-community/Qwen2-0.5B-Instruct-ONNX",
+        "low_tier_model": "onnx-community/SmolLM2-135M-Instruct-ONNX-MHA",
+        "cpu_fallback_model": "onnx-community/SmolLM2-135M-Instruct-ONNX",
     }
 
 
