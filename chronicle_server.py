@@ -378,7 +378,8 @@ def collect_research_bundle(payload):
         f"Title: {plan['title']}",
         f"Research depth: {payload['depth']}",
         f"Explanation style: {payload['explanation_style']}",
-        "Planner mode: lightweight heuristic planner to preserve RAM before generation.",
+        "Planner mode: fast heuristic planner.",
+        "Search source: Google",
         f"Research budget: {research_budget_seconds}s",
     ]
     if market_snapshot:
@@ -405,7 +406,7 @@ def collect_research_bundle(payload):
                     break
 
                 logs.append(f"  Result {rank_index}: {result['title']}")
-                article_text = newsletter_agent.fetch_article_text(result["url"], settings["article_chars"])
+                article_text = ""
                 source_text = newsletter_agent.build_source_text(result, article_text)
                 if not source_text:
                     logs.append("  Skipped source: no article text or search snippet available")

@@ -124,28 +124,28 @@ EXPLANATION_STYLE_GUIDANCE = {
 }
 DEPTH_PRESETS = {
     "low": {
-        "query_limit": 2,
+        "query_limit": 1,
         "results_per_query": 2,
-        "article_chars": 2500,
-        "summary_tokens": 120,
-        "newsletter_tokens": 650,
-        "research_budget_seconds": 45,
+        "article_chars": 0,
+        "summary_tokens": 100,
+        "newsletter_tokens": 520,
+        "research_budget_seconds": 12,
     },
     "medium": {
-        "query_limit": 3,
-        "results_per_query": 3,
-        "article_chars": 4500,
-        "summary_tokens": 180,
-        "newsletter_tokens": 850,
-        "research_budget_seconds": 75,
+        "query_limit": 1,
+        "results_per_query": 2,
+        "article_chars": 0,
+        "summary_tokens": 120,
+        "newsletter_tokens": 620,
+        "research_budget_seconds": 15,
     },
     "high": {
-        "query_limit": 4,
-        "results_per_query": 4,
-        "article_chars": 6500,
-        "summary_tokens": 240,
-        "newsletter_tokens": 1050,
-        "research_budget_seconds": 110,
+        "query_limit": 2,
+        "results_per_query": 3,
+        "article_chars": 0,
+        "summary_tokens": 160,
+        "newsletter_tokens": 760,
+        "research_budget_seconds": 22,
     },
 }
 MODEL_PROFILES = {
@@ -1372,48 +1372,18 @@ def looks_like_crypto_brief(brief):
 
 
 def search_web(query, max_results, deadline=None):
-    providers = (
-        ("Google News RSS", search_google_news_rss),
-        ("DuckDuckGo HTML", search_duckduckgo_html),
-        ("DuckDuckGo Lite", search_duckduckgo_lite),
-        ("Bing", search_bing_html),
-    )
-    results = []
-    seen_urls = set()
-    direct_result_count = 0
-    query_variants = build_search_query_variants(query)
+    if deadline and time.monotonic() >= deadline:
+        print("  Search budget reached before Google search started.")
+        return []
 
-    for variant_index, query_variant in enumerate(query_variants, start=1):
-        if deadline and time.monotonic() >= deadline:
-            print("  Search budget reached before all query variants finished.")
-            break
+    query_variant = build_search_query_variants(query)[0]
+    try:
+        results = search_google_news_rss(query_variant, max_results)
+    except Exception as exc:
+        print(f"  Google search failed: {exc}")
+        return []
 
-        if variant_index > 1:
-            print(f"  Search retry: {query_variant}")
-
-        for provider_name, provider_fn in providers:
-            if deadline and time.monotonic() >= deadline:
-                print("  Search budget reached while checking providers.")
-                return results[:max_results]
-
-            try:
-                provider_results = provider_fn(query_variant, max_results)
-            except Exception as exc:
-                print(f"  {provider_name} failed: {exc}")
-                continue
-
-            print(f"  {provider_name}: {len(provider_results)} result(s)")
-            for result in provider_results:
-                url = result.get("url", "")
-                if not url or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                results.append(result)
-                if not is_indirect_source_url(url):
-                    direct_result_count += 1
-                if len(results) >= max_results and direct_result_count >= min(2, max_results):
-                    return results[:max_results]
-
+    print(f"  Google search: {len(results)} result(s)")
     return prioritize_sources(results)[:max_results]
 
 
