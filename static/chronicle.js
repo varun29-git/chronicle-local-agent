@@ -504,6 +504,220 @@ function buildResearchLogs(research) {
   return logs;
 }
 
+function buildEditorialPacket(research) {
+  const selectedSources = selectTopSources(research.sources || [], 5);
+  const themeTerms = extractThemeTerms(selectedSources, 6);
+  const keyEvidence = selectedSources
+    .slice(0, 3)
+    .map((source) => cleanupSourceTitle(source.title));
+  const workingThesis = buildWorkingThesis(research, selectedSources, themeTerms);
+  const coverageGap = buildCoverageGap(selectedSources);
+
+  return {
+    brief: research.brief,
+    title: research.plan?.title || "Newsletter",
+    audience: research.plan?.audience || "General readers",
+    tone: research.plan?.tone || "Sharp and analytical",
+    days: research.days,
+    depth: research.depth,
+    explanationStyle: research.explanation_style,
+    styleInstructions: research.style_instructions || "",
+    queries: research.plan?.queries || [],
+    sections: research.plan?.sections || ["What happened", "Why it matters", "What to watch next"],
+    marketSnapshot: research.market_snapshot || [],
+    selectedSources,
+    themeTerms,
+    keyEvidence,
+    workingThesis,
+    coverageGap,
+  };
+}
+
+function selectTopSources(sources, limit) {
+  const deduped = [];
+  const seen = new Set();
+
+  sources
+    .map((source, index) => ({
+      ...source,
+      sourceText: trimText(
+        source.source_text || source.article_text || source.snippet || "",
+        420,
+      ),
+      relevanceScore: rankSourceForDraft(source, index),
+    }))
+    .sort((left, right) => right.relevanceScore - left.relevanceScore)
+    .forEach((source) => {
+      const key = normalizeSourceIdentity(source);
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      deduped.push(source);
+    });
+
+  return deduped.slice(0, limit);
+}
+
+function rankSourceForDraft(source, index) {
+  let score = 10 - index * 0.15;
+  if (!isIndirectSource(source)) {
+    score += 4;
+  }
+  if (source.article_text) {
+    score += 2;
+  }
+  if (source.snippet) {
+    score += 1.5;
+  }
+  if (source.source_text) {
+    score += Math.min(2, source.source_text.length / 280);
+  }
+  return score;
+}
+
+function normalizeSourceIdentity(source) {
+  const titleKey = cleanupSourceTitle(source.title)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+  try {
+    const parsed = new URL(source.url || "", window.location.origin);
+    if (parsed.hostname.includes("news.google.com")) {
+      return `title:${titleKey}`;
+    }
+    return `url:${parsed.hostname}${parsed.pathname}`;
+  } catch (error) {
+    return `title:${titleKey}`;
+  }
+}
+
+function isIndirectSource(source) {
+  return /news\.google\.com/i.test(source?.url || "");
+}
+
+function cleanupSourceTitle(title) {
+  return String(title || "")
+    .replace(/\s+-\s+(Reuters|AP News|Associated Press|MSN|AOL\.com|Yahoo!?\s*News|DW\.com)$/i, "")
+    .trim();
+}
+
+function extractThemeTerms(sources, limit) {
+  const termScores = new Map();
+  const stopwords = new Set([
+    "about", "after", "amid", "analysis", "and", "are", "but", "from", "have", "into",
+    "latest", "news", "over", "says", "saying", "that", "the", "their", "this", "what",
+    "when", "where", "which", "will", "with", "would",
+  ]);
+
+  sources.forEach((source) => {
+    const text = `${cleanupSourceTitle(source.title)} ${source.snippet || ""}`.toLowerCase();
+    const words = text.match(/[a-z][a-z0-9-]{2,}/g) || [];
+    const seenInSource = new Set();
+    words.forEach((word) => {
+      if (stopwords.has(word) || seenInSource.has(word)) {
+        return;
+      }
+      seenInSource.add(word);
+      termScores.set(word, (termScores.get(word) || 0) + 1);
+    });
+  });
+
+  return [...termScores.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, limit)
+    .map(([term]) => term);
+}
+
+function buildWorkingThesis(research, selectedSources, themeTerms) {
+  if (!selectedSources.length) {
+    return `Chronicle has not verified enough reporting yet on "${research.brief}" and should draft carefully from the confirmed brief only.`;
+  }
+
+  if (themeTerms.length >= 2) {
+    return `The strongest verified signal in this brief is the overlap between ${themeTerms[0]} and ${themeTerms[1]}, not any single isolated headline.`;
+  }
+
+  return `The clearest verified pattern is that ${cleanupSourceTitle(selectedSources[0].title)} carries the lead signal for this briefing.`;
+}
+
+function buildCoverageGap(selectedSources) {
+  if (!selectedSources.length) {
+    return "No external reporting was verified, so the draft must stay explicit about uncertainty.";
+  }
+  if (selectedSources.every((source) => isIndirectSource(source))) {
+    return "Most evidence is coming from headline-level feeds, so the draft should stay conservative about details.";
+  }
+  return "Use the selected sources directly and avoid claims that are not grounded in the retrieved evidence.";
+}
+
+function buildReasoningSummary(packet) {
+  return [
+    `Focus: ${packet.brief}`,
+    `Working thesis: ${packet.workingThesis}`,
+    `Evidence selected: ${packet.selectedSources.length} unique source(s)`,
+    `Key evidence: ${packet.keyEvidence.join(" | ") || "No source headlines yet"}`,
+    `Coverage gap: ${packet.coverageGap}`,
+  ].join("\n");
+}
+
+function finalizeNewsletterMarkdown(markdown, packet) {
+  let text = String(markdown || "").trim();
+  if (!text) {
+    text = renderFallbackNewsletter(packet);
+  }
+  if (!/^#\s+/m.test(text)) {
+    text = `# ${packet.title}\n\n${text}`;
+  }
+  if (!/\n##\s+Sources\b/i.test(text)) {
+    text = `${text.trim()}\n\n${buildSourcesSection(packet)}`;
+  }
+  return text.trim();
+}
+
+function renderFallbackNewsletter(packet) {
+  const lines = [
+    `# ${packet.title}`,
+    "",
+    `${packet.workingThesis}`,
+    "",
+  ];
+
+  packet.sections.forEach((sectionName, index) => {
+    lines.push(`## ${sectionName}`);
+    const source = packet.selectedSources[index] || packet.selectedSources[0];
+    if (source) {
+      lines.push(
+        `${cleanupSourceTitle(source.title)} provides the clearest verified anchor here. ${trimText(source.sourceText || source.snippet || "", 280)} [${Math.min(index + 1, packet.selectedSources.length)}]`,
+      );
+    } else {
+      lines.push("Chronicle could not verify enough fresh reporting for this section, so this draft stays explicit about that gap.");
+    }
+    lines.push("");
+  });
+
+  lines.push("## Closing note");
+  lines.push(packet.coverageGap);
+  lines.push("");
+  lines.push(buildSourcesSection(packet));
+  return lines.join("\n");
+}
+
+function buildSourcesSection(packet) {
+  const sources = packet.selectedSources.length
+    ? packet.selectedSources
+      .map((source, index) => `[${index + 1}]: ${cleanupSourceTitle(source.title)} - ${source.url}`)
+      .join("\n")
+    : "No external sources were successfully collected.";
+
+  const marketLine = packet.marketSnapshot?.length
+    ? "\n[M1]: CoinGecko Markets API - https://www.coingecko.com/"
+    : "";
+
+  return `## Sources\n${sources}${marketLine}`;
+}
+
 function detectBrowserCapabilities(browserConfig) {
   const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
   const deviceMemory = Number(navigator.deviceMemory || 0);
@@ -729,6 +943,7 @@ function calculateBrowserProfile(config) {
       percentage: 100,
       label: "Single bundle",
       maxNewTokens: config.hasWebGPU ? 420 : 280,
+      generationTimeoutMs: config.hasWebGPU ? 180000 : 120000,
       temperature: 0.2,
     };
   }
@@ -759,6 +974,7 @@ function calculateBrowserProfile(config) {
     percentage,
     label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
     maxNewTokens,
+    generationTimeoutMs: percentage >= 50 ? 210000 : 150000,
     temperature: 0.2,
   };
 }
@@ -819,6 +1035,9 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     sliceLabel,
     percentage,
     maxNewTokens,
+    generationTimeoutMs: device === "webgpu"
+      ? Math.max(120000, recommendedProfile.generationTimeoutMs - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 15000)
+      : Math.min(120000, recommendedProfile.generationTimeoutMs),
     temperature: recommendedProfile.temperature,
     modelOptions,
   };
@@ -861,6 +1080,15 @@ async function fetchJSON(url, options = {}) {
     throw new Error(data.error || `Request failed: ${response.status}`);
   }
   return data;
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]);
 }
 
 function stripMarkdownFences(text) {
