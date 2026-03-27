@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chronicle</title>
+  <meta
+    name="description"
+    content="Chronicle is a local-first newsletter studio that serves one local model bundle to every browser and adapts the active Gemma slice to the device."
+  >
+  <link rel="stylesheet" href="/static/chronicle.css">
+</head>
+<body>
+  <div class="ambient ambient-a"></div>
+  <div class="ambient ambient-b"></div>
+  <div class="grain"></div>
+
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <span class="brand-mark">Chronicle</span>
+        <span class="brand-tag">Local-first newsletter studio</span>
+      </div>
+      <div class="topbar-actions">
+        <a class="ghost-link" href="#library">Issue library</a>
+        <a class="ghost-link" href="#preview">Live preview</a>
+      </div>
+    </header>
+
+    <section class="hero-grid">
+      <div class="hero-copy panel panel-hero">
+        <p class="eyebrow">Ship tonight, run everywhere</p>
+        <h1>One local model. Every device.</h1>
+        <p class="hero-lede">
+          Chronicle serves a local browser model bundle from this machine, then lets each browser
+          pick the heaviest slice it can actually hold. That keeps inference on-device for laptops,
+          desktops, and weaker fallback hardware without asking end users for Hugging Face access.
+        </p>
+        <div class="hero-pills">
+          <span class="pill">Local model serving</span>
+          <span class="pill">Device-adaptive slices</span>
+          <span class="pill">No HF login prompts</span>
+          <span class="pill">Editable issue docs</span>
+        </div>
+      </div>
+
+      <aside class="panel panel-runtime" id="runtime-panel">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Local runtime</p>
+            <h2>This machine</h2>
+          </div>
+          <span class="status-badge" id="runtime-badge">Inspecting</span>
+        </div>
+
+        <div class="runtime-callout">
+          <p id="runtime-headline">Connecting to Chronicle on this device…</p>
+          <p id="runtime-subline" class="subcopy">
+            Chronicle checks the host runtime, the local browser model bundle, and the currently recommended device slice.
+          </p>
+        </div>
+
+        <section class="browser-ai-strip">
+          <div class="browser-ai-row">
+            <div>
+              <p class="panel-kicker browser-ai-kicker">Browser inference</p>
+              <h3>Local browser model</h3>
+            </div>
+            <span class="status-badge" id="browser-ai-badge">Checking</span>
+          </div>
+          <p class="subcopy browser-ai-copy" id="browser-ai-copy">
+            Chronicle will load the local model bundle from this server and adapt the active slice to the browser hardware.
+          </p>
+        </section>
+
+        <div class="stat-grid">
+          <article class="stat-card">
+            <span class="stat-label">Backend</span>
+            <strong id="stat-backend">—</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">Slice</span>
+            <strong id="stat-slice">—</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">Memory</span>
+            <strong id="stat-memory">—</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">Model</span>
+            <strong id="stat-model-ready">—</strong>
+          </article>
+        </div>
+
+        <dl class="runtime-details">
+          <div>
+            <dt>Hostname</dt>
+            <dd id="detail-hostname">—</dd>
+          </div>
+          <div>
+            <dt>Platform</dt>
+            <dd id="detail-platform">—</dd>
+          </div>
+          <div>
+            <dt>Device class</dt>
+            <dd id="detail-device-class">—</dd>
+          </div>
+          <div>
+            <dt>Model path</dt>
+            <dd id="detail-model-path">—</dd>
+          </div>
+          <div>
+            <dt>Local model root</dt>
+            <dd id="detail-model-root">—</dd>
+          </div>
+        </dl>
+      </aside>
+    </section>
+
+    <section class="workspace-grid">
+      <section class="panel panel-compose">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Issue builder</p>
+            <h2>Make a Chronicle</h2>
+          </div>
+          <span class="mini-badge">Research on host, writing in browser</span>
+        </div>
+
+        <form id="composer-form" class="composer-form">
+          <label class="field">
+            <span class="field-label">Brief</span>
+            <textarea
+              id="brief"
+              name="brief"
+              rows="6"
+              placeholder="Example: The strategic meaning of Europe’s new AI sovereignty push"
+              required
+            ></textarea>
+          </label>
+
+          <div class="field-group">
+            <div class="field">
+              <span class="field-label">Research depth</span>
+              <div class="segmented" data-segment="depth">
+                <button type="button" class="segment" data-value="low">Low</button>
+                <button type="button" class="segment is-active" data-value="medium">Medium</button>
+                <button type="button" class="segment" data-value="high">High</button>
+              </div>
+              <input type="hidden" name="depth" value="medium">
+            </div>
+
+            <div class="field">
+              <span class="field-label">Explanation style</span>
+              <div class="segmented" data-segment="explanation_style">
+                <button type="button" class="segment is-active" data-value="concise">Concise</button>
+                <button type="button" class="segment" data-value="feynman">Feynman</button>
+                <button type="button" class="segment" data-value="soc">Socratic</button>
+                <button type="button" class="segment" data-value="custom">Custom</button>
+              </div>
+              <input type="hidden" name="explanation_style" value="concise">
+            </div>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span class="field-label">Days</span>
+              <input type="number" name="days" min="1" max="30" value="7">
+            </label>
+            <label class="field">
+              <span class="field-label">Queries</span>
+              <input type="number" name="queries" min="1" max="8" value="4">
+            </label>
+            <label class="field">
+              <span class="field-label">Results / query</span>
+              <input type="number" name="results_per_query" min="1" max="8" value="3">
+            </label>
+            <label class="field">
+              <span class="field-label">Device override</span>
+              <select name="device_class">
+                <option value="">Auto-detect</option>
+                <option value="macbook">Macbook</option>
+                <option value="midrange_laptop">Midrange laptop</option>
+                <option value="gaming_laptop">Gaming laptop</option>
+                <option value="midrange_phone">Midrange phone</option>
+                <option value="flagship_phone">Flagship phone</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field custom-style-field is-hidden" id="custom-style-field">
+            <span class="field-label">Custom style instructions</span>
+            <textarea
+              name="style_instructions"
+              rows="4"
+              placeholder="Example: ruthless, high-agency, investor-letter tone with tight paragraphs and zero filler"
+            ></textarea>
+          </label>
+
+          <div class="composer-actions">
+            <button type="submit" class="primary-button" id="generate-button">
+              Generate locally
+            </button>
+            <p class="subcopy">
+              Chronicle writes in the user’s browser, then saves an editable HTML issue and a markdown source file.
+            </p>
+          </div>
+        </form>
+      </section>
+
+      <aside class="panel panel-job">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Live run state</p>
+            <h2>Generation status</h2>
+          </div>
+          <span class="status-badge" id="job-badge">Idle</span>
+        </div>
+
+        <div class="job-spotlight">
+          <p class="job-message" id="job-message">
+            No Chronicle issue is running right now.
+          </p>
+          <p class="subcopy" id="job-subcopy">
+            When a run starts, this panel tracks local research, browser generation, and the saved issue output.
+          </p>
+        </div>
+
+        <div class="job-actions">
+          <a id="job-open-html" class="ghost-button is-disabled" href="#" target="_blank" rel="noreferrer">Open HTML</a>
+          <a id="job-open-md" class="ghost-button is-disabled" href="#" target="_blank" rel="noreferrer">Open markdown</a>
+        </div>
+
+        <div class="run-summary" id="job-summary">
+          <div>
+            <span class="summary-label">Last completed</span>
+            <strong id="job-run-title">—</strong>
+          </div>
+          <div>
+            <span class="summary-label">Created</span>
+            <strong id="job-run-time">—</strong>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="library-grid">
+      <section class="panel panel-library" id="library">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Archive</p>
+            <h2>Chronicle library</h2>
+          </div>
+          <span class="mini-badge" id="library-count">0 issues</span>
+        </div>
+        <div class="run-list" id="run-list">
+          <article class="empty-state">
+            <h3>No issues yet</h3>
+            <p>Generate a Chronicle issue and it will appear here with one-click preview access.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel panel-preview" id="preview">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Issue stage</p>
+            <h2>Preview + edit handoff</h2>
+          </div>
+          <div class="preview-actions">
+            <a id="preview-open-html" class="ghost-button is-disabled" href="#" target="_blank" rel="noreferrer">Open editor</a>
+            <a id="preview-open-md" class="ghost-button is-disabled" href="#" target="_blank" rel="noreferrer">View markdown</a>
+          </div>
+        </div>
+
+        <div class="preview-meta" id="preview-meta">
+          <div>
+            <span class="summary-label">Selected issue</span>
+            <strong id="preview-title">Choose an issue</strong>
+          </div>
+          <div>
+            <span class="summary-label">Mode</span>
+            <strong id="preview-mode">HTML editor</strong>
+          </div>
+        </div>
+
+        <div class="preview-frame-wrap">
+          <iframe
+            id="preview-frame"
+            title="Chronicle issue preview"
+            srcdoc="<p style='font-family: sans-serif; color: #ddd; padding: 2rem;'>Select an issue to preview it here.</p>"
+          ></iframe>
+        </div>
+      </section>
+    </section>
+  </div>
+
+  <script src="/static/chronicle.js" defer></script>
+</body>
+</html>
