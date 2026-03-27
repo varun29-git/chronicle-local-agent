@@ -11,6 +11,12 @@ const state = {
   hasRenderedIntro: false,
 };
 
+const TURN_STAGES = [
+  { key: "research", index: "01", title: "Extracting web info" },
+  { key: "brain", index: "02", title: "Sending to Chronicle brain" },
+  { key: "generate", index: "03", title: "Generating newsletter" },
+];
+
 const elements = {};
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -123,14 +129,11 @@ function renderHeaderStatus() {
   if (browserReady && primaryProfile) {
     const runtimeMode = browserCapabilities.hasWebGPU ? "WebGPU" : "WASM";
     const sliceText = supportsSlicing ? primaryProfile.sliceLabel : "single local bundle";
-    elements.statusCopy.textContent =
-      `${modelName} is available locally. Chronicle will use ${runtimeMode} and target ${sliceText} on this device.`;
+    elements.statusCopy.textContent = `${modelName}. ${runtimeMode}. ${sliceText}.`;
   } else if (runtime?.dependencies_ready && runtime?.model_ready) {
-    elements.statusCopy.textContent =
-      "The local browser model is unavailable, but the host runtime can still generate newsletters here.";
+    elements.statusCopy.textContent = "Browser bundle unavailable. Host runtime is ready.";
   } else {
-    elements.statusCopy.textContent =
-      "Chronicle could not find a complete local runtime path yet. Add the local model bundle or host fallback model to continue.";
+    elements.statusCopy.textContent = "Chronicle still needs a complete local runtime path.";
   }
 }
 
@@ -144,15 +147,15 @@ function buildIntroMessage() {
     return [
       "Chronicle is ready.",
       `Local model: ${modelName}`,
-      firstCandidate ? `Current device target: ${firstCandidate.label}` : "",
-      "Send a brief and I’ll show planning, evidence selection, drafting, and the full search log while I work.",
+      firstCandidate ? `Device target: ${firstCandidate.label}` : "",
+      "Pick a mode, choose search depth, and open the finished HTML issue when Chronicle is done.",
     ]
       .filter(Boolean)
       .join("\n");
   }
 
   if (state.serverRuntime?.dependencies_ready && state.serverRuntime?.model_ready) {
-    return "Chronicle is ready through the host runtime. Send a brief and I’ll show the search and drafting log in the chat.";
+    return "Chronicle is ready through the host runtime. Pick a mode and Chronicle will write the issue.";
   }
 
   return "Chronicle is online, but the local runtime still needs a complete model path before generation can succeed.";
@@ -162,24 +165,26 @@ function startNewTurn(userPrompt) {
   appendUserMessage(userPrompt);
   elements.brief.value = "";
   state.currentTurn = {
-    statusNode: appendAssistantMessage("Starting research…"),
-    logContainer: appendLogCard(),
-    displayedJobLogCount: 0,
-    reasoningNode: null,
+    statusNode: appendAssistantMessage("Extracting web info", "Stage"),
+    stageNode: appendStageCard(),
     resultNode: null,
     completed: false,
   };
+  setStageState("research", "active");
+  setStageState("brain", "pending");
+  setStageState("generate", "pending");
 }
 
 function startRecoveredTurn() {
   state.currentTurn = {
-    statusNode: appendAssistantMessage("Resuming the current local run…"),
-    logContainer: appendLogCard(),
-    displayedJobLogCount: 0,
-    reasoningNode: null,
+    statusNode: appendAssistantMessage("Resuming Chronicle", "Stage"),
+    stageNode: appendStageCard(),
     resultNode: null,
     completed: false,
   };
+  setStageState("research", "complete");
+  setStageState("brain", "complete");
+  setStageState("generate", "active");
 }
 
 function updateTurnStatus(text) {
@@ -190,20 +195,7 @@ function updateTurnStatus(text) {
 }
 
 function appendLogLines(lines) {
-  const turn = ensureCurrentTurn();
-  const fragment = document.createDocumentFragment();
-  (lines || []).forEach((line) => {
-    const text = String(line || "").trim();
-    if (!text) {
-      return;
-    }
-    const row = document.createElement("div");
-    row.className = "log-line";
-    row.textContent = text;
-    fragment.appendChild(row);
-  });
-  turn.logContainer.appendChild(fragment);
-  scrollThreadToBottom();
+  void lines;
 }
 
 function appendResultCard(run, markdown) {
@@ -252,24 +244,20 @@ function updateLiveDraft(text) {
 }
 
 function upsertReasoningSummary(text) {
-  const turn = ensureCurrentTurn();
-  if (!turn.reasoningNode) {
-    turn.reasoningNode = appendAssistantMessage(text, "Chronicle's brain");
-    return;
-  }
-  turn.reasoningNode.querySelector(".message-body").textContent = text;
-  scrollThreadToBottom();
+  void text;
 }
 
 function finishTurnWithError(message) {
   setGenerateBusy(false);
   stopPolling();
   updateTurnStatus("Run failed.");
+  setStageState("generate", "error");
   appendSystemMessage(message);
 }
 
 async function runBrowserGeneration(payload) {
-  updateTurnStatus("Fast research stage: planning and Google search…");
+  setStageState("research", "active");
+  updateTurnStatus("Extracting web info");
   const researchResponse = await fetchJSON("/api/research", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -277,20 +265,14 @@ async function runBrowserGeneration(payload) {
   });
   const research = researchResponse.research;
   const packet = buildEditorialPacket(research);
-  appendLogLines(buildVisibleProcessLogs(research, packet));
-  updateTurnStatus("Source collection complete. Sending the evidence packet to Chronicle's brain.");
-  upsertReasoningSummary(buildReasoningSummary(packet, "Source packet prepared. Chronicle is about to form its argument from the web evidence."));
+  setStageState("research", "complete");
+  setStageState("brain", "active");
+  updateTurnStatus("Sending to Chronicle brain");
 
   let markdown = "";
   let usedFallbackDraft = false;
 
-  updateTurnStatus("Chronicle is preparing the writing pass.");
-  appendLogLines([
-    "Evidence packet sent to Chronicle's brain.",
-    "Chronicle is reviewing the web evidence and forming a single argument.",
-    "Loading Chronicle's local brain.",
-  ]);
-  upsertReasoningSummary(buildReasoningSummary(packet, "Loading Chronicle's local brain for argument and drafting."));
+  updateTurnStatus("Sending to Chronicle brain");
 
   try {
     const aiSession = await withTimeout(
@@ -298,48 +280,26 @@ async function runBrowserGeneration(payload) {
       20000,
       "Browser model loading took too long. Using Chronicle's backup draft instead.",
     );
-    updateTurnStatus("Chronicle's brain is reading the source packet and forming the newsletter argument.");
-    appendLogLines([
-      `Local brain ready: ${aiSession.profile.label}`,
-      `Execution mode: ${aiSession.profile.device.toUpperCase()}`,
-      `Writing budget: ${Math.round(aiSession.profile.generationTimeoutMs / 1000)}s`,
-      `Writing mode: ${packet.explanationStyle}`,
-      "Chronicle is forming the argument directly from the source packet.",
-    ]);
-    updateTurnStatus(`Generating newsletter now. This is the slow stage: ${aiSession.profile.label}.`);
-    appendLogLines([
-      "Generation started. Chronicle is now writing the newsletter from the web evidence.",
-    ]);
-    upsertReasoningSummary(buildReasoningSummary(packet, "Chronicle is writing the newsletter now."));
+    setStageState("brain", "complete");
+    setStageState("generate", "active");
+    updateTurnStatus("Generating newsletter");
 
     const generatedMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
-      if (partialText.trim()) {
-        upsertReasoningSummary(
-          buildReasoningSummary(packet, describeGenerationStage(packet, partialText.trim())),
-        );
-      }
+      void partialText;
     });
     markdown = finalizeNewsletterMarkdown(stripMarkdownFences(generatedMarkdown), packet);
   } catch (error) {
-    appendLogLines([
-      `Model drafting failed: ${error.message || "Unknown error"}`,
-      "Switching to Chronicle's backup drafting path from the collected evidence.",
-    ]);
+    void error;
+    setStageState("brain", "complete");
+    setStageState("generate", "active");
     usedFallbackDraft = true;
     markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
-    upsertReasoningSummary(buildReasoningSummary(packet, "Local model was unavailable, so Chronicle built a backup issue from the source packet."));
   }
 
   const normalizedMarkdown = finalizeNewsletterMarkdown(markdown, packet);
   const title = extractTitleFromMarkdown(normalizedMarkdown, packet.title);
 
-  updateTurnStatus("Saving the newsletter…");
-  upsertReasoningSummary(buildReasoningSummary(packet, "Saving the newsletter files now."));
-  appendLogLines([
-    usedFallbackDraft
-      ? "Backup draft complete. Saving issue files…"
-      : "Model draft complete. Saving issue files…",
-  ]);
+  updateTurnStatus("Saving newsletter");
 
   const saveResponse = await fetchJSON("/api/runs/save", {
     method: "POST",
@@ -364,15 +324,8 @@ async function runBrowserGeneration(payload) {
   });
 
   setGenerateBusy(false);
-  updateTurnStatus(
-    usedFallbackDraft
-      ? `Issue ready: ${saveResponse.run.title} (deterministic draft)`
-      : `Issue ready: ${saveResponse.run.title}`,
-  );
-  appendLogLines([
-    `Saved HTML: ${saveResponse.run.html_path || "Unavailable"}`,
-    `Saved markdown: ${saveResponse.run.markdown_path || "Unavailable"}`,
-  ]);
+  setStageState("generate", "complete", usedFallbackDraft ? "Backup issue ready" : "Issue ready");
+  updateTurnStatus(`Issue ready: ${saveResponse.run.title}`);
   appendResultCard(saveResponse.run, normalizedMarkdown);
   await refreshStatus();
 }
@@ -395,17 +348,21 @@ function renderJobState(job) {
 
   if (job.status === "queued" || job.status === "running") {
     setGenerateBusy(true);
+    setStageState("research", "complete");
+    setStageState("brain", "complete");
+    setStageState("generate", "active");
   }
   updateTurnStatus(job.message || "Chronicle is working…");
-  appendJobLogs(job);
 
   if (job.status === "failed") {
+    setStageState("generate", "error");
     finishTurnWithError(job.error?.message || job.message || "Chronicle failed to finish the run.");
     return;
   }
 
   if (job.status === "completed") {
     setGenerateBusy(false);
+    setStageState("generate", "complete", "Issue ready");
     stopPolling();
     if (job.result) {
       appendResultCard(job.result, "");
@@ -415,13 +372,7 @@ function renderJobState(job) {
 }
 
 function appendJobLogs(job) {
-  const turn = ensureCurrentTurn();
-  const logs = job.logs || [];
-  const newLines = logs.slice(turn.displayedJobLogCount);
-  if (newLines.length) {
-    appendLogLines(newLines);
-    turn.displayedJobLogCount = logs.length;
-  }
+  void job;
 }
 
 function startPolling(jobId) {
@@ -487,18 +438,63 @@ function appendMessage(role, text, label = "") {
   return article;
 }
 
-function appendLogCard() {
+function appendStageCard() {
   const article = document.createElement("article");
   article.className = "message message--assistant";
   article.innerHTML = `
-    <div class="message-card log-card">
-      <p class="message-label">Process log</p>
-      <div class="log-list"></div>
+    <div class="stage-card">
+      <div class="stage-header">
+        <div>
+          <p class="message-label">Chronicle pipeline</p>
+          <p class="stage-title">Three-stage generation flow</p>
+        </div>
+        <p class="stage-meta">Live</p>
+      </div>
+      <div class="stage-list">
+        ${TURN_STAGES.map((stage) => `
+          <div class="stage-item is-pending" data-stage="${stage.key}">
+            <div class="stage-index">${stage.index}</div>
+            <div class="stage-copy">
+              <p class="stage-name">${stage.title}</p>
+              <p class="stage-detail">Waiting</p>
+            </div>
+            <div class="stage-badge">Pending</div>
+          </div>
+        `).join("")}
+      </div>
     </div>
   `;
   elements.chatThread.appendChild(article);
   scrollThreadToBottom();
-  return article.querySelector(".log-list");
+  return article;
+}
+
+function setStageState(stageKey, status, detail = "") {
+  const turn = ensureCurrentTurn();
+  if (!turn.stageNode) {
+    return;
+  }
+
+  const row = turn.stageNode.querySelector(`[data-stage="${stageKey}"]`);
+  if (!row) {
+    return;
+  }
+
+  row.classList.remove("is-pending", "is-active", "is-complete", "is-error");
+  row.classList.add(`is-${status}`);
+
+  const detailNode = row.querySelector(".stage-detail");
+  const badgeNode = row.querySelector(".stage-badge");
+  const presets = {
+    pending: { detail: "Waiting", badge: "Pending" },
+    active: { detail: "Working", badge: "Live" },
+    complete: { detail: "Complete", badge: "Done" },
+    error: { detail: "Blocked", badge: "Error" },
+  };
+  const preset = presets[status] || presets.pending;
+  detailNode.textContent = detail || preset.detail;
+  badgeNode.textContent = preset.badge;
+  scrollThreadToBottom();
 }
 
 function setGenerateBusy(isBusy) {
@@ -1065,14 +1061,23 @@ async function ensureBrowserSession() {
   throw new Error(lastError?.message || "No browser inference backend could be initialized.");
 }
 
-async function generateNewsletterMarkdown(research, packet, editorialMemo, aiSession, onProgress) {
+async function generateNewsletterMarkdown(research, packet, aiSession, onProgress) {
   const messages = [
+    {
+      role: "system",
+      content: [
+        {
+          type: "text",
+          text: buildModeSystemPrompt(packet),
+        },
+      ],
+    },
     {
       role: "user",
       content: [
         {
           type: "text",
-          text: buildNewsletterPrompt(research, packet, editorialMemo),
+          text: buildNewsletterPrompt(research, packet),
         },
       ],
     },
@@ -1105,8 +1110,10 @@ async function generateNewsletterMarkdown(research, packet, editorialMemo, aiSes
     aiSession.model.generate({
       ...inputs,
       max_new_tokens: aiSession.profile.maxNewTokens,
-      do_sample: false,
-      repetition_penalty: 1.06,
+      do_sample: true,
+      temperature: aiSession.profile.temperature,
+      top_p: 0.9,
+      repetition_penalty: 1.12,
       streamer,
     }),
     aiSession.profile.generationTimeoutMs,
@@ -1124,179 +1131,30 @@ async function generateNewsletterMarkdown(research, packet, editorialMemo, aiSes
   return generatedText || streamedText;
 }
 
-async function generateEditorialMemo(research, packet, aiSession) {
-  const messages = [
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: buildEditorialMemoPrompt(research, packet),
-        },
-      ],
-    },
+function buildModeSystemPrompt(packet) {
+  const lines = [
+    "You are Chronicle, a premium newsletter writer.",
+    "Turn the source packet into a coherent argument-led newsletter.",
+    "Reason over the evidence before writing.",
+    "Write polished, grammatical prose with smooth transitions.",
+    "Never copy source text or headline phrasing into the body.",
+    "Use URLs only in the final Sources section.",
   ];
-  const prompt = aiSession.processor.apply_chat_template(messages, {
-    add_generation_prompt: true,
-  });
-  const inputs = await aiSession.processor(prompt, null, null, {
-    add_special_tokens: false,
-  });
-  const inputLength = inputs.input_ids?.dims?.at(-1);
 
-  if (!inputLength) {
-    throw new Error("Gemma 3n processor did not return input ids for editorial reasoning.");
+  if (packet.explanationStyle === "feynman") {
+    lines.push("Explain difficult ideas in plain language without losing the causal logic.");
+  } else if (packet.explanationStyle === "soc") {
+    lines.push("Use a Socratic mode: organize the issue around the right questions and answers while keeping it readable.");
+  } else if (packet.explanationStyle === "custom" && packet.styleInstructions) {
+    lines.push(`Follow this custom writing guidance exactly: ${packet.styleInstructions}`);
+  } else {
+    lines.push("Be concise, selective, and high-signal.");
   }
 
-  const output = await withTimeout(
-    aiSession.model.generate({
-      ...inputs,
-      max_new_tokens: aiSession.profile.reasoningMaxNewTokens,
-      do_sample: false,
-      repetition_penalty: 1.04,
-    }),
-    aiSession.profile.reasoningTimeoutMs,
-    "Browser reasoning timed out before Chronicle could finish the editorial memo.",
-  );
-  const generatedTokens = output.slice(null, [inputLength, null]);
-  const decoded = aiSession.processor.batch_decode(generatedTokens, {
-    skip_special_tokens: true,
-  });
-  const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
-  const cleaned = stripMarkdownFences(String(generatedText || "")).trim();
-  if (!cleaned) {
-    throw new Error("Editorial memo came back empty.");
-  }
-  return cleaned;
+  return lines.join("\n");
 }
 
-async function rewriteNewsletterMarkdown(research, packet, editorialMemo, draftMarkdown, aiSession) {
-  const messages = [
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: buildRewritePrompt(research, packet, editorialMemo, draftMarkdown),
-        },
-      ],
-    },
-  ];
-  const prompt = aiSession.processor.apply_chat_template(messages, {
-    add_generation_prompt: true,
-  });
-  const inputs = await aiSession.processor(prompt, null, null, {
-    add_special_tokens: false,
-  });
-  const inputLength = inputs.input_ids?.dims?.at(-1);
-
-  if (!inputLength) {
-    throw new Error("Gemma 3n processor did not return input ids for newsletter revision.");
-  }
-
-  const output = await withTimeout(
-    aiSession.model.generate({
-      ...inputs,
-      max_new_tokens: aiSession.profile.maxNewTokens,
-      do_sample: false,
-      repetition_penalty: 1.08,
-    }),
-    Math.min(aiSession.profile.generationTimeoutMs, 120000),
-    "Browser revision timed out before Chronicle could clean the newsletter draft.",
-  );
-  const generatedTokens = output.slice(null, [inputLength, null]);
-  const decoded = aiSession.processor.batch_decode(generatedTokens, {
-    skip_special_tokens: true,
-  });
-  const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
-  const cleaned = stripMarkdownFences(String(generatedText || "")).trim();
-  if (!cleaned) {
-    throw new Error("Newsletter revision came back empty.");
-  }
-  return cleaned;
-}
-
-function buildEditorialMemoPrompt(research, packet) {
-  const sourceBundle = packet.selectedSources
-    .map((source, index) => {
-      return [
-        `[${index + 1}] ${cleanupSourceTitle(source.title)}`,
-        `Notes: ${trimText(source.sourceText || source.snippet || "", 220)}`,
-      ].join("\n");
-    })
-    .join("\n\n");
-
-  return `You are Chronicle's editorial strategist.
-
-Before drafting the newsletter, think through the evidence and return a short editorial memo for the writer.
-
-Brief:
-${research.brief}
-
-Audience:
-${research.plan.audience}
-
-Tone:
-${research.plan.tone}
-
-Explanation style:
-${research.explanation_style}
-
-Style guidance:
-${packet.styleGuidance}
-
-Planned sections:
-${JSON.stringify(packet.sections)}
-
-Evidence:
-${sourceBundle || "No sources collected."}
-
-Return plain text only in exactly four lines:
-Core thesis: ...
-Hidden pattern: ...
-Killer insight: ...
-Writing approach: ...
-
-Rules:
-- make the thesis defensible from the evidence
-- identify the pattern linking the sources together
-- make the killer insight memorable, not generic
-- adapt the writing approach to the requested explanation style
-- do not mention prompts, tools, or implementation details`;
-}
-
-function buildRewritePrompt(research, packet, editorialMemo, draftMarkdown) {
-  return `You are Chronicle's final editor.
-
-Rewrite the markdown newsletter below so it reads like a polished human-written issue.
-
-Brief:
-${research.brief}
-
-Explanation style:
-${research.explanation_style}
-
-Style guidance:
-${packet.styleGuidance}
-
-Editorial reasoning memo:
-${editorialMemo}
-
-Draft to rewrite:
-${draftMarkdown}
-
-Rules:
-- return full markdown only
-- preserve the title, section structure, and citations
-- remove repeated sentences, scaffolding phrases, and awkward grammar
-- make transitions logical and smooth
-- do not sound like transformed search output
-- do not add new facts that are not already supported by the draft
-- honor the requested explanation style all the way through
-- keep the prose clean, readable, and premium`;
-}
-
-function buildNewsletterPrompt(research, packet, editorialMemo) {
+function buildNewsletterPrompt(research, packet) {
   const sourceBundle = packet.selectedSources
     .map((source, index) => {
       const excerpt = trimText(source.sourceText || "", 260);
@@ -1348,14 +1206,13 @@ Last ${packet.days} days
 Planned sections:
 ${JSON.stringify(packet.sections)}
 
-Editorial reasoning memo:
-${editorialMemo}
+Research notes:
+${sourceBundle || "No sources were collected."}
 
 Structured market data:
 ${marketData}
 
-Research notes:
-${sourceBundle || "No sources were collected."}
+${customStyle}
 
 Requirements:
 - return markdown only
@@ -1363,9 +1220,9 @@ Requirements:
 - aim for roughly 700 to 950 words
 - write a sharp opening note with a real point of view, not a generic summary
 - organize the body around the planned sections using H2 headings
-- use the editorial reasoning memo to keep a strong throughline instead of just listing events
+- read the full source packet, decide what the central argument is, and make the whole issue serve that argument
 - make each section advance the argument, not repeat the headline
-- synthesize at least two source notes when the evidence allows it
+- synthesize multiple source notes when the evidence allows it
 - keep the writing analytical, premium, and specific
 - explain why the developments matter for a reader, not just what happened
 - if evidence is thin, say so cleanly instead of inventing details
@@ -1384,42 +1241,9 @@ Requirements:
 - do not use markdown code fences
 - do not mention system prompts or implementation details
 - do not write meta phrases like "here is the newsletter" or "based on the sources"
-- do not copy or paraphrase newsroom scaffolding such as "the clearest anchor is", "a second signal from", or "suggests the section should focus"
 - do not repeat a sentence or clause structure across sections
 - every section must read like original prose written for humans, not like transformed search output
 - do not expose your hidden reasoning process; only output the final newsletter`;
-}
-
-function needsNewsletterRewrite(markdown) {
-  const normalized = String(markdown || "").toLowerCase();
-  const bannedPhrases = [
-    "suggests the section should focus",
-    "the clearest anchor is",
-    "a second signal from",
-    "the pattern beneath the headlines is convergence",
-    "the right takeaway is not that the feed was busy",
-  ];
-  if (bannedPhrases.some((phrase) => normalized.includes(phrase))) {
-    return true;
-  }
-
-  const sentences = String(markdown || "")
-    .split(/(?<=[.!?])\s+/)
-    .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence.length > 40);
-  const seen = new Set();
-  for (const sentence of sentences) {
-    const key = sentence
-      .toLowerCase()
-      .replace(/\[[^\]]+\]/g, " ")
-      .replace(/[^a-z0-9]+/g, " ")
-      .trim();
-    if (seen.has(key)) {
-      return true;
-    }
-    seen.add(key);
-  }
-  return false;
 }
 
 function calculateBrowserProfile(config) {
@@ -1435,7 +1259,7 @@ function calculateBrowserProfile(config) {
       reasoningMaxNewTokens: 220,
       reasoningTimeoutMs: config.hasWebGPU ? 90000 : 75000,
       generationTimeoutMs: config.hasWebGPU ? 240000 : 210000,
-      temperature: 0.2,
+      temperature: 0.65,
     };
   }
 
@@ -1468,7 +1292,7 @@ function calculateBrowserProfile(config) {
     reasoningMaxNewTokens: 220,
     reasoningTimeoutMs: percentage >= 50 ? 100000 : 80000,
     generationTimeoutMs: percentage >= 50 ? 240000 : 210000,
-    temperature: 0.2,
+    temperature: 0.65,
   };
 }
 
