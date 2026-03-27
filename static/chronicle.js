@@ -110,6 +110,7 @@ function renderHeaderStatus() {
   const browserReady = Boolean(browserConfig?.local_model_ready);
   const supportsSlicing = Boolean(browserConfig?.supports_slicing);
   const primaryProfile = browserCapabilities?.candidates?.[0];
+  const modelName = browserConfig?.display_name || "Gemma 3n adaptive";
 
   if (browserReady) {
     setStatusPill(browserCapabilities?.hasWebGPU ? "Browser ready" : "WASM ready", "");
@@ -123,7 +124,7 @@ function renderHeaderStatus() {
     const runtimeMode = browserCapabilities.hasWebGPU ? "WebGPU" : "WASM";
     const sliceText = supportsSlicing ? primaryProfile.sliceLabel : "single local bundle";
     elements.statusCopy.textContent =
-      `${browserConfig.display_name} is available locally. Chronicle will use ${runtimeMode} and target ${sliceText} on this device.`;
+      `${modelName} is available locally. Chronicle will use ${runtimeMode} and target ${sliceText} on this device.`;
   } else if (runtime?.dependencies_ready && runtime?.model_ready) {
     elements.statusCopy.textContent =
       "The local browser model is unavailable, but the host runtime can still generate newsletters here.";
@@ -136,14 +137,15 @@ function renderHeaderStatus() {
 function buildIntroMessage() {
   const browserConfig = state.browserConfig;
   const browserCapabilities = state.browserCapabilities;
+  const modelName = browserConfig?.display_name || "Gemma 3n adaptive";
 
   if (browserConfig?.local_model_ready) {
     const firstCandidate = browserCapabilities?.candidates?.[0];
     return [
       "Chronicle is ready.",
-      `Local model: ${browserConfig.display_name || browserConfig.local_model_id}`,
+      `Local model: ${modelName}`,
       firstCandidate ? `Current device target: ${firstCandidate.label}` : "",
-      "Send a brief and I’ll show the full search log while I work.",
+      "Send a brief and I’ll show planning, evidence selection, drafting, and the full search log while I work.",
     ]
       .filter(Boolean)
       .join("\n");
@@ -163,6 +165,7 @@ function startNewTurn(userPrompt) {
     statusNode: appendAssistantMessage("Starting research…"),
     logContainer: appendLogCard(),
     displayedJobLogCount: 0,
+    resultNode: null,
     completed: false,
   };
 }
@@ -172,6 +175,7 @@ function startRecoveredTurn() {
     statusNode: appendAssistantMessage("Resuming the current local run…"),
     logContainer: appendLogCard(),
     displayedJobLogCount: 0,
+    resultNode: null,
     completed: false,
   };
 }
@@ -207,21 +211,40 @@ function appendResultCard(run, markdown) {
   }
 
   const visibleText = stripMarkdownFences(markdown || "").trim() || run?.title || "Newsletter ready.";
+  const card = ensureResultNode();
+  card.querySelector(".message-body").textContent = visibleText;
+  card.querySelector(".result-actions").innerHTML = `
+    ${run?.html_url ? `<a class="result-link" href="${escapeHtml(run.html_url)}" target="_blank" rel="noreferrer">Open HTML</a>` : ""}
+    ${run?.markdown_url ? `<a class="result-link" href="${escapeHtml(run.markdown_url)}" target="_blank" rel="noreferrer">Open markdown</a>` : ""}
+  `;
+  turn.completed = true;
+  scrollThreadToBottom();
+}
+
+function ensureResultNode() {
+  const turn = ensureCurrentTurn();
+  if (turn.resultNode) {
+    return turn.resultNode;
+  }
+
   const card = document.createElement("article");
   card.className = "message message--assistant";
   card.innerHTML = `
     <div class="message-card result-card">
       <p class="message-label">Chronicle</p>
       <div class="message-body"></div>
-      <div class="result-actions">
-        ${run?.html_url ? `<a class="result-link" href="${escapeHtml(run.html_url)}" target="_blank" rel="noreferrer">Open HTML</a>` : ""}
-        ${run?.markdown_url ? `<a class="result-link" href="${escapeHtml(run.markdown_url)}" target="_blank" rel="noreferrer">Open markdown</a>` : ""}
-      </div>
+      <div class="result-actions"></div>
     </div>
   `;
-  card.querySelector(".message-body").textContent = visibleText;
   elements.chatThread.appendChild(card);
-  turn.completed = true;
+  turn.resultNode = card;
+  scrollThreadToBottom();
+  return card;
+}
+
+function updateLiveDraft(text) {
+  const card = ensureResultNode();
+  card.querySelector(".message-body").textContent = text || "Drafting…";
   scrollThreadToBottom();
 }
 
@@ -241,20 +264,53 @@ async function runBrowserGeneration(payload) {
   });
   const research = researchResponse.research;
   appendLogLines(research.logs || buildResearchLogs(research));
-
-  const aiSession = await ensureBrowserSession();
-  updateTurnStatus(`Drafting locally with ${aiSession.profile.label}…`);
+  const packet = buildEditorialPacket(research);
+  appendAssistantMessage(buildReasoningSummary(packet), "Reasoning summary");
   appendLogLines([
-    `Loading local model: ${aiSession.profile.label}`,
-    `Generation backend: ${aiSession.profile.device.toUpperCase()}`,
+    `Evidence selected: ${packet.selectedSources.length} unique source(s)`,
+    `Working thesis: ${packet.workingThesis}`,
+    `Coverage gaps: ${packet.coverageGap}`,
   ]);
 
-  const markdown = await generateNewsletterMarkdown(research, aiSession);
-  const normalizedMarkdown = stripMarkdownFences(markdown);
-  const title = extractTitleFromMarkdown(normalizedMarkdown, research.plan.title);
+  let markdown = "";
+  let usedFallbackDraft = false;
+
+  try {
+    const aiSession = await ensureBrowserSession();
+    updateTurnStatus(`Drafting locally with ${aiSession.profile.label}…`);
+    appendLogLines([
+      `Loading local model: ${aiSession.profile.label}`,
+      `Generation backend: ${aiSession.profile.device.toUpperCase()}`,
+      `Generation budget: ${Math.round(aiSession.profile.generationTimeoutMs / 1000)}s`,
+    ]);
+
+    updateLiveDraft("Drafting locally from the selected evidence…");
+    markdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
+      if (partialText.trim()) {
+        updateLiveDraft(partialText.trim());
+      }
+    });
+  } catch (error) {
+    appendLogLines([
+      `Model drafting failed: ${error.message || "Unknown error"}`,
+      "Switching to deterministic drafting from the collected evidence.",
+    ]);
+    markdown = renderFallbackNewsletter(packet);
+    usedFallbackDraft = true;
+  }
+
+  const normalizedMarkdown = finalizeNewsletterMarkdown(
+    stripMarkdownFences(markdown),
+    packet,
+  );
+  const title = extractTitleFromMarkdown(normalizedMarkdown, packet.title);
 
   updateTurnStatus("Saving the newsletter…");
-  appendLogLines(["Draft complete. Saving issue files…"]);
+  appendLogLines([
+    usedFallbackDraft
+      ? "Deterministic draft complete. Saving issue files…"
+      : "Model draft complete. Saving issue files…",
+  ]);
 
   const saveResponse = await fetchJSON("/api/runs/save", {
     method: "POST",
@@ -266,20 +322,24 @@ async function runBrowserGeneration(payload) {
       depth: payload.depth,
       explanation_style: payload.explanation_style,
       style_instructions: payload.style_instructions,
-      audience: research.plan.audience,
-      tone: research.plan.tone,
-      queries: research.plan.queries,
-      sections: research.plan.sections,
-      sources: research.sources.map((source) => ({
+      audience: packet.audience,
+      tone: packet.tone,
+      queries: packet.queries,
+      sections: packet.sections,
+      sources: packet.selectedSources.map((source) => ({
         ...source,
-        source_summary: source.source_text,
-        relevance_score: 0.5,
+        source_summary: source.sourceText,
+        relevance_score: source.relevanceScore,
       })),
     }),
   });
 
   setGenerateBusy(false);
-  updateTurnStatus(`Issue ready: ${saveResponse.run.title}`);
+  updateTurnStatus(
+    usedFallbackDraft
+      ? `Issue ready: ${saveResponse.run.title} (deterministic draft)`
+      : `Issue ready: ${saveResponse.run.title}`,
+  );
   appendLogLines([
     `Saved HTML: ${saveResponse.run.html_path || "Unavailable"}`,
     `Saved markdown: ${saveResponse.run.markdown_path || "Unavailable"}`,
@@ -375,19 +435,20 @@ function appendUserMessage(text) {
   return appendMessage("user", text);
 }
 
-function appendAssistantMessage(text) {
-  return appendMessage("assistant", text);
+function appendAssistantMessage(text, label = "") {
+  return appendMessage("assistant", text, label);
 }
 
-function appendSystemMessage(text) {
-  return appendMessage("system", text);
+function appendSystemMessage(text, label = "") {
+  return appendMessage("system", text, label);
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, label = "") {
   const article = document.createElement("article");
   article.className = `message message--${role}`;
   article.innerHTML = `
     <div class="message-card">
+      ${label ? `<p class="message-label">${escapeHtml(label)}</p>` : ""}
       <div class="message-body"></div>
     </div>
   `;
@@ -483,7 +544,7 @@ async function ensureBrowserSession() {
     throw new Error("No local browser model bundle is available on this server.");
   }
 
-  const { AutoModelForImageTextToText, AutoProcessor, env } = await import(TRANSFORMERS_CDN);
+  const { AutoModelForImageTextToText, AutoProcessor, TextStreamer, env } = await import(TRANSFORMERS_CDN);
   env.allowRemoteModels = false;
   env.allowLocalModels = true;
   env.localModelPath = "/models";
@@ -504,6 +565,7 @@ async function ensureBrowserSession() {
       state.browserSession = {
         processor,
         model,
+        TextStreamer,
         profile: candidate,
       };
       return state.browserSession;
@@ -517,14 +579,14 @@ async function ensureBrowserSession() {
   throw new Error(lastError?.message || "No browser inference backend could be initialized.");
 }
 
-async function generateNewsletterMarkdown(research, aiSession) {
+async function generateNewsletterMarkdown(research, packet, aiSession, onProgress) {
   const messages = [
     {
       role: "user",
       content: [
         {
           type: "text",
-          text: buildNewsletterPrompt(research),
+          text: buildNewsletterPrompt(research, packet),
         },
       ],
     },
@@ -541,28 +603,44 @@ async function generateNewsletterMarkdown(research, aiSession) {
     throw new Error("Gemma 3n processor did not return input ids for generation.");
   }
 
-  const output = await aiSession.model.generate({
-    ...inputs,
-    max_new_tokens: aiSession.profile.maxNewTokens,
-    do_sample: false,
-  });
+  let streamedText = "";
+  const streamer = aiSession.TextStreamer
+    ? new aiSession.TextStreamer(aiSession.processor.tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function: (text) => {
+        streamedText += text;
+        onProgress?.(streamedText);
+      },
+    })
+    : null;
+
+  const output = await withTimeout(
+    aiSession.model.generate({
+      ...inputs,
+      max_new_tokens: aiSession.profile.maxNewTokens,
+      do_sample: false,
+      streamer,
+    }),
+    aiSession.profile.generationTimeoutMs,
+    "Browser generation timed out before the newsletter finished.",
+  );
   const generatedTokens = output.slice(null, [inputLength, null]);
   const decoded = aiSession.processor.batch_decode(generatedTokens, {
     skip_special_tokens: true,
   });
   const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
 
-  if (!generatedText) {
+  if (!generatedText && !streamedText.trim()) {
     throw new Error("Browser model returned an empty response.");
   }
-  return generatedText;
+  return generatedText || streamedText;
 }
 
-function buildNewsletterPrompt(research) {
-  const sourceBundle = research.sources
-    .slice(0, 4)
+function buildNewsletterPrompt(research, packet) {
+  const sourceBundle = packet.selectedSources
     .map((source, index) => {
-      const excerpt = trimText(source.source_text || source.article_text || source.snippet || "", 520);
+      const excerpt = trimText(source.sourceText || "", 260);
       return [
         `[${index + 1}] ${source.title}`,
         `URL: ${source.url}`,
@@ -605,10 +683,18 @@ ${research.explanation_style}
 ${customStyle}
 
 Coverage window:
-Last ${research.days} days
+Last ${packet.days} days
 
 Planned sections:
-${JSON.stringify(research.plan.sections)}
+${JSON.stringify(packet.sections)}
+
+Reasoning summary:
+${JSON.stringify({
+  working_thesis: packet.workingThesis,
+  key_evidence: packet.keyEvidence,
+  coverage_gap: packet.coverageGap,
+  dominant_themes: packet.themeTerms,
+})}
 
 Structured market data:
 ${marketData}
@@ -622,6 +708,7 @@ Requirements:
 - aim for roughly 550 to 800 words
 - write a short opening note with a point of view
 - organize the body around the planned sections using H2 headings
+- use the reasoning summary to keep a strong throughline instead of just listing events
 - keep the writing analytical, premium, and specific
 - cite source notes inline like [1], [2]
 - if market data is present, reference it as [M1]

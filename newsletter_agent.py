@@ -45,6 +45,8 @@ DEFAULT_BROWSER_MODEL_CANDIDATES = tuple(
     candidate
     for candidate in (
         DEFAULT_BROWSER_MODEL_ID,
+        "onnx-community/gemma-3n-E4B-it-ONNX",
+        "gemma-3n-E4B-it-ONNX",
         "onnx-community/gemma-3n-E2B-it-ONNX",
         "gemma-3n-E2B-it-ONNX",
         "gemma-3-it",
@@ -831,18 +833,41 @@ def build_browser_model_descriptor(model_reference):
     supports_slicing = "gemma3n" in lower_hints or "gemma-3n" in lower_hints
     preferred_precision, dtype_map = detect_browser_model_precision(model_path)
 
+    display_name, model_variant = derive_browser_display_name(normalized_reference, model_type, architecture)
+
     return {
         "ready": bool(model_path and os.path.isdir(model_path) and os.path.exists(config_path)),
         "model_id": model_id,
         "model_path": model_path,
         "model_type": model_type,
         "architecture": architecture,
+        "model_variant": model_variant,
         "supports_slicing": supports_slicing,
         "max_slices": 8 if supports_slicing else 1,
         "preferred_precision": preferred_precision,
         "dtype_map": dtype_map,
-        "display_name": architecture or model_type or normalized_reference or "Local browser model",
+        "display_name": display_name,
     }
+
+
+def derive_browser_display_name(model_reference, model_type, architecture):
+    lower_hints = " ".join(
+        part.lower()
+        for part in (model_reference, model_type, architecture)
+        if part
+    )
+
+    if "gemma-3n-e4b" in lower_hints:
+        return "Gemma 3n E4B adaptive", "E4B"
+    if "gemma-3n-e2b" in lower_hints:
+        return "Gemma 3n adaptive", "E2B"
+    if "gemma-3n" in lower_hints:
+        return "Gemma 3n adaptive", "3n"
+    if "gemma-3" in lower_hints:
+        return "Gemma 3", "3"
+
+    fallback_name = architecture or model_type or model_reference or "Local browser model"
+    return fallback_name, ""
 
 
 def resolve_browser_model_location(model_reference):
@@ -1355,6 +1380,7 @@ def search_web(query, max_results, deadline=None):
     )
     results = []
     seen_urls = set()
+    direct_result_count = 0
     query_variants = build_search_query_variants(query)
 
     for variant_index, query_variant in enumerate(query_variants, start=1):
@@ -1383,10 +1409,12 @@ def search_web(query, max_results, deadline=None):
                     continue
                 seen_urls.add(url)
                 results.append(result)
-                if len(results) >= max_results:
+                if not is_indirect_source_url(url):
+                    direct_result_count += 1
+                if len(results) >= max_results and direct_result_count >= min(2, max_results):
                     return results[:max_results]
 
-    return results[:max_results]
+    return prioritize_sources(results)[:max_results]
 
 
 def search_google_news_rss(query, max_results):
@@ -1416,6 +1444,21 @@ def search_google_news_rss(query, max_results):
             break
 
     return results
+
+
+def is_indirect_source_url(url):
+    lowered = str(url or "").lower()
+    return "news.google.com/" in lowered
+
+
+def prioritize_sources(results):
+    return sorted(
+        results,
+        key=lambda item: (
+            1 if is_indirect_source_url(item.get("url", "")) else 0,
+            -len(str(item.get("snippet", "") or "")),
+        ),
+    )
 
 
 def search_duckduckgo_html(query, max_results):
