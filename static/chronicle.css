@@ -187,6 +187,14 @@ body {
   font-size: 0.98rem;
 }
 
+.result-title {
+  margin: 0 0 12px;
+  font-family: var(--display-font);
+  font-size: 1.12rem;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
 .log-card {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02)),
@@ -227,6 +235,11 @@ body {
   background: rgba(255, 255, 255, 0.04);
   color: var(--text);
   text-decoration: none;
+}
+
+.result-link--primary {
+  border-color: rgba(255, 145, 81, 0.3);
+  background: linear-gradient(135deg, rgba(255, 145, 81, 0.24), rgba(255, 145, 81, 0.12));
 }
 
 .composer-form {

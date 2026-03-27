@@ -214,9 +214,11 @@ function appendResultCard(run, markdown) {
 
   const visibleText = stripMarkdownFences(markdown || "").trim() || run?.title || "Newsletter ready.";
   const card = ensureResultNode();
+  const resultTitle = run?.title || "Newsletter ready";
+  card.querySelector(".result-title").textContent = resultTitle;
   card.querySelector(".message-body").textContent = visibleText;
   card.querySelector(".result-actions").innerHTML = `
-    ${run?.html_url ? `<a class="result-link" href="${escapeHtml(run.html_url)}" target="_blank" rel="noreferrer">Open HTML</a>` : ""}
+    ${run?.html_url ? `<a class="result-link result-link--primary" href="${escapeHtml(run.html_url)}" target="_blank" rel="noreferrer">Open HTML issue</a>` : ""}
     ${run?.markdown_url ? `<a class="result-link" href="${escapeHtml(run.markdown_url)}" target="_blank" rel="noreferrer">Open markdown</a>` : ""}
   `;
   turn.completed = true;
@@ -234,8 +236,9 @@ function ensureResultNode() {
   card.innerHTML = `
     <div class="message-card result-card">
       <p class="message-label">Chronicle</p>
-      <div class="message-body"></div>
+      <p class="result-title"></p>
       <div class="result-actions"></div>
+      <div class="message-body"></div>
     </div>
   `;
   elements.chatThread.appendChild(card);
@@ -246,6 +249,7 @@ function ensureResultNode() {
 
 function updateLiveDraft(text) {
   const card = ensureResultNode();
+  card.querySelector(".result-title").textContent = "Draft in progress";
   card.querySelector(".message-body").textContent = text || "Drafting…";
   scrollThreadToBottom();
 }
@@ -281,11 +285,13 @@ async function runBrowserGeneration(payload) {
   appendLogLines([
     `Evidence selected: ${packet.selectedSources.length} unique source(s)`,
     `Working thesis: ${packet.workingThesis}`,
+    `Editorial lead: ${packet.leadAngle}`,
     `Coverage gaps: ${packet.coverageGap}`,
   ]);
 
   let markdown = finalizeNewsletterMarkdown(renderFallbackNewsletter(packet), packet);
   let usedFallbackDraft = false;
+  let editorialMemo = buildEditorialMemoText(packet.editorialBrief);
 
   updateLiveDraft(markdown);
   updateTurnStatus("Fast draft prepared. Optional local model refinement is starting now.");
@@ -301,20 +307,42 @@ async function runBrowserGeneration(payload) {
       20000,
       "Browser model loading took too long. Using the fast draft instead.",
     );
-    updateTurnStatus(`Generating newsletter now. This is the slow stage: ${aiSession.profile.label}.`);
+    updateTurnStatus("Local reasoning stage: building the editorial memo before drafting.");
     appendLogLines([
       `Loading local model: ${aiSession.profile.label}`,
       `Generation backend: ${aiSession.profile.device.toUpperCase()}`,
+      `Reasoning budget: ${Math.round(aiSession.profile.reasoningTimeoutMs / 1000)}s`,
+      "Local model is building an editorial memo from the collected evidence.",
+    ]);
+    upsertReasoningSummary(buildReasoningSummary(packet, "Building the local editorial reasoning memo."));
+
+    try {
+      editorialMemo = await generateEditorialMemo(research, packet, aiSession);
+      appendLogLines([
+        "Local reasoning memo complete.",
+        `Editorial memo: ${trimText(editorialMemo, 220)}`,
+      ]);
+      upsertReasoningSummary(buildReasoningSummary(packet, "Editorial reasoning complete. Drafting is starting now.", editorialMemo));
+    } catch (memoError) {
+      appendLogLines([
+        `Editorial memo fallback: ${memoError.message || "Unknown error"}`,
+        "Using Chronicle's heuristic editorial brief for the drafting pass.",
+      ]);
+      editorialMemo = buildEditorialMemoText(packet.editorialBrief);
+    }
+
+    updateTurnStatus(`Generating newsletter now. This is the slow stage: ${aiSession.profile.label}.`);
+    appendLogLines([
       `Generation budget: ${Math.round(aiSession.profile.generationTimeoutMs / 1000)}s`,
       "Generation started. Waiting here is expected until the draft appears.",
     ]);
     upsertReasoningSummary(buildReasoningSummary(packet, "Generating a polished newsletter draft locally."));
 
-    const generatedMarkdown = await generateNewsletterMarkdown(research, packet, aiSession, (partialText) => {
+    const generatedMarkdown = await generateNewsletterMarkdown(research, packet, editorialMemo, aiSession, (partialText) => {
       if (partialText.trim()) {
         updateLiveDraft(partialText.trim());
         upsertReasoningSummary(
-          buildReasoningSummary(packet, `Generating newsletter locally. Current draft length: ${partialText.trim().length} characters.`),
+          buildReasoningSummary(packet, describeGenerationStage(packet, partialText.trim()), editorialMemo),
         );
       }
     });
@@ -533,13 +561,25 @@ function buildResearchLogs(research) {
 }
 
 function buildEditorialPacket(research) {
-  const selectedSources = selectTopSources(research.sources || [], 5);
+  const selectedSources = selectTopSources(research.sources || [], 6);
   const themeTerms = extractThemeTerms(selectedSources, 6);
   const keyEvidence = selectedSources
     .slice(0, 3)
     .map((source) => cleanupSourceTitle(source.title));
   const workingThesis = buildWorkingThesis(research, selectedSources, themeTerms);
   const coverageGap = buildCoverageGap(selectedSources);
+  const leadAngle = buildLeadAngle(research, selectedSources, workingThesis);
+  const sectionAngles = buildSectionAngles(research.plan?.sections || [], selectedSources);
+  const closingInsight = buildClosingInsight(themeTerms, coverageGap);
+  const styleGuidance = buildStyleGuidance(research.explanation_style, research.style_instructions || "");
+  const editorialBrief = buildHeuristicEditorialBrief(
+    research,
+    selectedSources,
+    workingThesis,
+    leadAngle,
+    coverageGap,
+    themeTerms,
+  );
 
   return {
     brief: research.brief,
@@ -558,6 +598,11 @@ function buildEditorialPacket(research) {
     keyEvidence,
     workingThesis,
     coverageGap,
+    leadAngle,
+    sectionAngles,
+    closingInsight,
+    styleGuidance,
+    editorialBrief,
   };
 }
 
@@ -568,7 +613,7 @@ function selectTopSources(sources, limit) {
   sources
     .map((source, index) => ({
       ...source,
-      sourceText: trimText(source.source_text || source.snippet || "", 280),
+      sourceText: trimText(extractEvidenceText(source), 320),
       relevanceScore: rankSourceForDraft(source, index),
     }))
     .sort((left, right) => right.relevanceScore - left.relevanceScore)
@@ -671,11 +716,17 @@ function buildCoverageGap(selectedSources) {
   return "Use the selected sources directly and avoid claims that are not grounded in the retrieved evidence.";
 }
 
-function buildReasoningSummary(packet, currentStage = "") {
+function buildReasoningSummary(packet, currentStage = "", editorialMemo = "") {
+  const editorialPlan = buildEditorialPlanSummary(packet);
+  const reasoningMemo = editorialMemo || buildEditorialMemoText(packet.editorialBrief);
   return [
     `Focus: ${packet.brief}`,
     currentStage ? `Current stage: ${currentStage}` : "",
-    `Working thesis: ${packet.workingThesis}`,
+    `Working thesis: ${packet.editorialBrief.coreThesis}`,
+    `Hidden pattern: ${packet.editorialBrief.hiddenPattern}`,
+    `Lead angle: ${packet.leadAngle}`,
+    editorialPlan ? `Editorial plan: ${editorialPlan}` : "",
+    reasoningMemo ? `Reasoning memo: ${reasoningMemo}` : "",
     `Evidence selected: ${packet.selectedSources.length} unique source(s)`,
     `Key evidence: ${packet.keyEvidence.join(" | ") || "No source headlines yet"}`,
     `Coverage gap: ${packet.coverageGap}`,
@@ -700,28 +751,209 @@ function renderFallbackNewsletter(packet) {
   const lines = [
     `# ${packet.title}`,
     "",
-    `${packet.workingThesis}`,
+    packet.editorialBrief.coreThesis,
+    "",
+    packet.editorialBrief.hiddenPattern,
     "",
   ];
 
   packet.sections.forEach((sectionName, index) => {
     lines.push(`## ${sectionName}`);
-    const source = packet.selectedSources[index] || packet.selectedSources[0];
-    if (source) {
-      lines.push(
-        `${cleanupSourceTitle(source.title)} provides the clearest verified anchor here. ${trimText(source.sourceText || source.snippet || "", 280)} [${Math.min(index + 1, packet.selectedSources.length)}]`,
-      );
-    } else {
-      lines.push("Chronicle could not verify enough fresh reporting for this section, so this draft stays explicit about that gap.");
-    }
+    lines.push(buildSectionLead(packet, sectionName, index));
+    lines.push("");
+    lines.push(buildSectionParagraph(packet, sectionName, index));
+    lines.push("");
+    lines.push(buildSectionImplication(packet, sectionName, index));
     lines.push("");
   });
 
   lines.push("## Closing note");
-  lines.push(packet.coverageGap);
+  lines.push(packet.editorialBrief.killerInsight);
+  lines.push("");
+  lines.push(packet.closingInsight);
   lines.push("");
   lines.push(buildSourcesSection(packet));
   return lines.join("\n");
+}
+
+function buildLeadAngle(research, selectedSources, workingThesis) {
+  if (!selectedSources.length) {
+    return `This briefing is running with limited verification, so the safest usable angle is to frame what is known, what is not, and why the gap matters.`;
+  }
+  return `${workingThesis} The goal of this issue is not to list every headline, but to isolate the directional shift that matters most for readers tracking ${research.brief}.`;
+}
+
+function buildSectionAngles(sections, selectedSources) {
+  return sections.map((sectionName, index) => {
+    const source = selectedSources[index] || selectedSources[0];
+    if (!source) {
+      return `The most honest move in ${sectionName.toLowerCase()} is to stay explicit about what the evidence does and does not support.`;
+    }
+    return `${cleanupSourceTitle(source.title)} suggests the section should focus on the highest-signal implication rather than repeating the headline.`;
+  });
+}
+
+function buildClosingInsight(themeTerms, coverageGap) {
+  if (themeTerms.length >= 3) {
+    return `The deeper pattern is the clustering of ${themeTerms.slice(0, 3).join(", ")} in the same reporting window. ${coverageGap}`;
+  }
+  return `The most useful takeaway is the directional signal, not the volume of headlines. ${coverageGap}`;
+}
+
+function buildEditorialPlanSummary(packet) {
+  const sectionPlan = packet.sections
+    .slice(0, 3)
+    .map((sectionName, index) => `${sectionName}: ${packet.sectionAngles[index] || packet.workingThesis}`)
+    .join(" | ");
+  return sectionPlan;
+}
+
+function buildEditorialMemoText(editorialBrief) {
+  if (!editorialBrief) {
+    return "";
+  }
+  return [
+    `Core thesis: ${editorialBrief.coreThesis}`,
+    `Hidden pattern: ${editorialBrief.hiddenPattern}`,
+    `Killer insight: ${editorialBrief.killerInsight}`,
+    `Writing approach: ${editorialBrief.writingApproach}`,
+  ].join(" | ");
+}
+
+function describeGenerationStage(packet, partialText) {
+  const headingMatches = partialText.match(/^##\s+/gm) || [];
+  const headingCount = headingMatches.length;
+  const cleaned = partialText.trim();
+
+  if (!cleaned) {
+    return "Preparing the local writing pass.";
+  }
+  if (headingCount === 0 && cleaned.length < 220) {
+    return "Writing the headline and opening angle.";
+  }
+  if (headingCount < Math.max(1, Math.min(packet.sections.length, 2))) {
+    return `Drafting the first body section around ${packet.sections[0] || "the lead theme"}.`;
+  }
+  if (headingCount < packet.sections.length) {
+    return `Drafting the middle sections. ${headingCount}/${packet.sections.length} section headings are in place.`;
+  }
+  if (!/\n##\s+Closing note\b/i.test(partialText)) {
+    return "Writing the closing synthesis and tightening the throughline.";
+  }
+  if (!/\n##\s+Sources\b/i.test(partialText)) {
+    return "Assembling the source notes and final structure.";
+  }
+  return "Finalizing the local draft and checking citation structure.";
+}
+
+function extractEvidenceText(source) {
+  const raw = String(source?.source_text || source?.article_text || source?.snippet || "").trim();
+  if (!raw) {
+    return cleanupSourceTitle(source?.title || "");
+  }
+
+  const snippetMatch = raw.match(/Snippet:\s*([\s\S]+)/i);
+  if (snippetMatch?.[1]) {
+    return cleanEvidenceText(snippetMatch[1]);
+  }
+
+  return cleanEvidenceText(raw);
+}
+
+function cleanEvidenceText(text) {
+  return String(text || "")
+    .replace(/^Title:\s*/gim, "")
+    .replace(/^URL:\s*\S+\s*$/gim, "")
+    .replace(/^Snippet:\s*/gim, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildStyleGuidance(explanationStyle, customStyleInstructions) {
+  if (explanationStyle === "custom" && customStyleInstructions.trim()) {
+    return customStyleInstructions.trim();
+  }
+  if (explanationStyle === "feynman") {
+    return "Explain the story with plain language, clean causality, and minimal jargon. Make complexity feel understandable.";
+  }
+  if (explanationStyle === "soc") {
+    return "Lead with the right questions, answer them step by step, and let each section deepen the reader's understanding.";
+  }
+  return "Be concise, selective, and high-signal. Prefer strong interpretation over padded recap.";
+}
+
+function buildHeuristicEditorialBrief(research, selectedSources, workingThesis, leadAngle, coverageGap, themeTerms) {
+  const strongestSignal = cleanupSourceTitle(selectedSources[0]?.title || research.brief);
+  const secondarySignal = cleanupSourceTitle(selectedSources[1]?.title || "");
+  const pairedThemes = themeTerms.slice(0, 2).join(" and ");
+  const dominantFrame = pairedThemes || research.brief;
+
+  return {
+    coreThesis: selectedSources.length
+      ? `${leadAngle} The strongest usable reading is that ${strongestSignal} matters because it changes how readers should interpret the broader direction of ${research.brief}.`
+      : workingThesis,
+    hiddenPattern: secondarySignal
+      ? `The pattern beneath the headlines is convergence: ${strongestSignal} and ${secondarySignal} are not random adjacent stories, but signs that ${dominantFrame} is becoming the frame that organizes the week.`
+      : `The hidden pattern is that the same topic is appearing across multiple angles, which usually matters more than any single headline on its own.`,
+    killerInsight: `The right takeaway is not that the feed was busy. It is that the reporting window points toward a clearer narrative center, and that center is ${dominantFrame}.`,
+    writingApproach: buildStyleGuidance(research.explanation_style, research.style_instructions || ""),
+    proofPoints: selectedSources
+      .slice(0, 3)
+      .map((source) => cleanupSourceTitle(source.title)),
+    coverageGap,
+  };
+}
+
+function buildSectionLead(packet, sectionName, index) {
+  if (packet.explanationStyle === "soc") {
+    return `The right question in ${sectionName.toLowerCase()} is this: what actually moved, and why should the reader care?`;
+  }
+  if (packet.explanationStyle === "feynman") {
+    return `The simplest way to read ${sectionName.toLowerCase()} is to separate the visible headline from the deeper shift underneath it.`;
+  }
+  return `${packet.sectionAngles[index] || packet.editorialBrief.coreThesis}`;
+}
+
+function buildSectionParagraph(packet, sectionName, index) {
+  const primarySource = packet.selectedSources[index] || packet.selectedSources[0];
+  const secondarySource = packet.selectedSources[index + 1] || packet.selectedSources[1];
+  const sectionAngle = packet.sectionAngles[index] || packet.editorialBrief.coreThesis;
+
+  if (!primarySource) {
+    return "Chronicle could not verify enough fresh reporting for this section, so this draft stays explicit about that gap.";
+  }
+
+  const primaryNote = trimText(primarySource.sourceText || primarySource.snippet || "", 180);
+  const primaryCitation = `[${Math.min(index + 1, packet.selectedSources.length)}]`;
+  const secondaryCitation = secondarySource ? `[${Math.min(index + 2, packet.selectedSources.length)}]` : "";
+  const corroboration = secondarySource
+    ? ` A second signal from ${cleanupSourceTitle(secondarySource.title)} sharpens the same picture rather than overturning it. ${secondaryCitation}`
+    : "";
+
+  if (packet.explanationStyle === "soc") {
+    return `What does the evidence actually say? Start with ${cleanupSourceTitle(primarySource.title)}: ${primaryNote} ${primaryCitation}${corroboration}`.trim();
+  }
+  if (packet.explanationStyle === "feynman") {
+    return `${sectionAngle} In plain terms, ${cleanupSourceTitle(primarySource.title)} suggests ${primaryNote} ${primaryCitation}${corroboration}`.trim();
+  }
+  return `${sectionAngle} The clearest anchor is ${cleanupSourceTitle(primarySource.title)}, which suggests ${primaryNote} ${primaryCitation}${corroboration}`.trim();
+}
+
+function buildSectionImplication(packet, sectionName, index) {
+  const primarySource = packet.selectedSources[index] || packet.selectedSources[0];
+  const themeA = packet.themeTerms[0] || "policy";
+  const themeB = packet.themeTerms[1] || "execution";
+  if (!primarySource) {
+    return `The implication for ${sectionName.toLowerCase()} is that readers should treat this as a watchlist item until stronger verification arrives.`;
+  }
+
+  if (packet.explanationStyle === "soc") {
+    return `Why does that matter? Because the real signal is not the isolated event itself, but the way ${themeA} is starting to interact with ${themeB}. That is the frame the rest of the issue should answer.`;
+  }
+  if (packet.explanationStyle === "feynman") {
+    return `Why it matters: this is easier to understand if you treat ${themeA} and ${themeB} as connected pieces of the same story. Once they start moving together, the week stops looking random.`;
+  }
+  return `Why this matters: the section is less about one isolated update and more about how ${themeA} is beginning to interact with ${themeB}. For readers following ${packet.brief}, that is the durable signal worth carrying forward from this reporting window.`;
 }
 
 function buildSourcesSection(packet) {
@@ -813,14 +1045,14 @@ async function ensureBrowserSession() {
   throw new Error(lastError?.message || "No browser inference backend could be initialized.");
 }
 
-async function generateNewsletterMarkdown(research, packet, aiSession, onProgress) {
+async function generateNewsletterMarkdown(research, packet, editorialMemo, aiSession, onProgress) {
   const messages = [
     {
       role: "user",
       content: [
         {
           type: "text",
-          text: buildNewsletterPrompt(research, packet),
+          text: buildNewsletterPrompt(research, packet, editorialMemo),
         },
       ],
     },
@@ -854,6 +1086,7 @@ async function generateNewsletterMarkdown(research, packet, aiSession, onProgres
       ...inputs,
       max_new_tokens: aiSession.profile.maxNewTokens,
       do_sample: false,
+      repetition_penalty: 1.06,
       streamer,
     }),
     aiSession.profile.generationTimeoutMs,
@@ -871,15 +1104,109 @@ async function generateNewsletterMarkdown(research, packet, aiSession, onProgres
   return generatedText || streamedText;
 }
 
-function buildNewsletterPrompt(research, packet) {
+async function generateEditorialMemo(research, packet, aiSession) {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: buildEditorialMemoPrompt(research, packet),
+        },
+      ],
+    },
+  ];
+  const prompt = aiSession.processor.apply_chat_template(messages, {
+    add_generation_prompt: true,
+  });
+  const inputs = await aiSession.processor(prompt, null, null, {
+    add_special_tokens: false,
+  });
+  const inputLength = inputs.input_ids?.dims?.at(-1);
+
+  if (!inputLength) {
+    throw new Error("Gemma 3n processor did not return input ids for editorial reasoning.");
+  }
+
+  const output = await withTimeout(
+    aiSession.model.generate({
+      ...inputs,
+      max_new_tokens: aiSession.profile.reasoningMaxNewTokens,
+      do_sample: false,
+      repetition_penalty: 1.04,
+    }),
+    aiSession.profile.reasoningTimeoutMs,
+    "Browser reasoning timed out before Chronicle could finish the editorial memo.",
+  );
+  const generatedTokens = output.slice(null, [inputLength, null]);
+  const decoded = aiSession.processor.batch_decode(generatedTokens, {
+    skip_special_tokens: true,
+  });
+  const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
+  const cleaned = stripMarkdownFences(String(generatedText || "")).trim();
+  if (!cleaned) {
+    throw new Error("Editorial memo came back empty.");
+  }
+  return cleaned;
+}
+
+function buildEditorialMemoPrompt(research, packet) {
+  const sourceBundle = packet.selectedSources
+    .map((source, index) => {
+      return [
+        `[${index + 1}] ${cleanupSourceTitle(source.title)}`,
+        `Notes: ${trimText(source.sourceText || source.snippet || "", 220)}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+
+  return `You are Chronicle's editorial strategist.
+
+Before drafting the newsletter, think through the evidence and return a short editorial memo for the writer.
+
+Brief:
+${research.brief}
+
+Audience:
+${research.plan.audience}
+
+Tone:
+${research.plan.tone}
+
+Explanation style:
+${research.explanation_style}
+
+Style guidance:
+${packet.styleGuidance}
+
+Planned sections:
+${JSON.stringify(packet.sections)}
+
+Evidence:
+${sourceBundle || "No sources collected."}
+
+Return plain text only in exactly four lines:
+Core thesis: ...
+Hidden pattern: ...
+Killer insight: ...
+Writing approach: ...
+
+Rules:
+- make the thesis defensible from the evidence
+- identify the pattern linking the sources together
+- make the killer insight memorable, not generic
+- adapt the writing approach to the requested explanation style
+- do not mention prompts, tools, or implementation details`;
+}
+
+function buildNewsletterPrompt(research, packet, editorialMemo) {
   const sourceBundle = packet.selectedSources
     .map((source, index) => {
       const excerpt = trimText(source.sourceText || "", 260);
       return [
-        `[${index + 1}] ${source.title}`,
-        `URL: ${source.url}`,
+        `[${index + 1}] ${cleanupSourceTitle(source.title)}`,
         `Query: ${source.query}`,
-        `Notes: ${excerpt}`,
+        `Evidence notes: ${excerpt}`,
       ].join("\n");
     })
     .join("\n\n");
@@ -894,7 +1221,7 @@ function buildNewsletterPrompt(research, packet) {
 
   return `You are Chronicle, a sharp local-first newsletter writer.
 
-Write one complete markdown newsletter.
+Think through the evidence silently first, then write one complete markdown newsletter.
 
 Newsletter brief:
 ${research.brief}
@@ -914,6 +1241,9 @@ ${research.depth}
 Explanation style:
 ${research.explanation_style}
 
+Requested explanation guidance:
+${packet.styleGuidance}
+
 ${customStyle}
 
 Coverage window:
@@ -922,13 +1252,17 @@ Last ${packet.days} days
 Planned sections:
 ${JSON.stringify(packet.sections)}
 
-Reasoning summary:
-${JSON.stringify({
-  working_thesis: packet.workingThesis,
-  key_evidence: packet.keyEvidence,
-  coverage_gap: packet.coverageGap,
-  dominant_themes: packet.themeTerms,
-})}
+Editorial reasoning memo:
+${editorialMemo}
+
+Heuristic editorial brief:
+${JSON.stringify(packet.editorialBrief)}
+
+Section plan:
+${JSON.stringify(packet.sections.map((section, index) => ({
+  section,
+  angle: packet.sectionAngles[index] || packet.editorialBrief.coreThesis,
+})))}
 
 Structured market data:
 ${marketData}
@@ -939,18 +1273,31 @@ ${sourceBundle || "No sources were collected."}
 Requirements:
 - return markdown only
 - start with one H1 title
-- aim for roughly 550 to 800 words
-- write a short opening note with a point of view
+- aim for roughly 700 to 950 words
+- write a sharp opening note with a real point of view, not a generic summary
 - organize the body around the planned sections using H2 headings
 - use the reasoning summary to keep a strong throughline instead of just listing events
+- make each section advance the argument, not repeat the headline
+- synthesize at least two source notes when the evidence allows it
 - keep the writing analytical, premium, and specific
+- explain why the developments matter for a reader, not just what happened
+- if evidence is thin, say so cleanly instead of inventing details
+- do not copy raw source notes, source labels, URLs, or "Title/URL/Snippet" text into the body
+- convert evidence into clean prose
+- honor the requested explanation style throughout the whole piece
+- for concise, compress aggressively and keep paragraphs tight
+- for feynman, explain complexity in plain language
+- for soc, structure the flow around the right questions and answers
+- for custom, follow the custom guidance over the default explanation modes
 - cite source notes inline like [1], [2]
 - if market data is present, reference it as [M1]
 - end with a Sources section
 - in Sources, list each source as [id]: title - url
 - if market data is present, include: [M1]: CoinGecko Markets API - https://www.coingecko.com/
 - do not use markdown code fences
-- do not mention system prompts or implementation details`;
+- do not mention system prompts or implementation details
+- do not write meta phrases like "here is the newsletter" or "based on the sources"
+- do not expose your hidden reasoning process; only output the final newsletter`;
 }
 
 function calculateBrowserProfile(config) {
@@ -962,8 +1309,10 @@ function calculateBrowserProfile(config) {
       sliceCount: 1,
       percentage: 100,
       label: "Single bundle",
-      maxNewTokens: config.hasWebGPU ? 300 : 220,
-      generationTimeoutMs: config.hasWebGPU ? 90000 : 75000,
+      maxNewTokens: config.hasWebGPU ? 700 : 520,
+      reasoningMaxNewTokens: 220,
+      reasoningTimeoutMs: config.hasWebGPU ? 90000 : 75000,
+      generationTimeoutMs: config.hasWebGPU ? 240000 : 210000,
       temperature: 0.2,
     };
   }
@@ -982,11 +1331,11 @@ function calculateBrowserProfile(config) {
   }
 
   const percentage = Math.round((sliceCount / maxSlices) * 100);
-  let maxNewTokens = 280;
+  let maxNewTokens = 520;
   if (percentage >= 50) {
-    maxNewTokens = 380;
+    maxNewTokens = 760;
   } else if (percentage >= 25) {
-    maxNewTokens = 320;
+    maxNewTokens = 620;
   }
 
   return {
@@ -994,7 +1343,9 @@ function calculateBrowserProfile(config) {
     percentage,
     label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
     maxNewTokens,
-    generationTimeoutMs: percentage >= 50 ? 110000 : 85000,
+    reasoningMaxNewTokens: 220,
+    reasoningTimeoutMs: percentage >= 50 ? 100000 : 80000,
+    generationTimeoutMs: percentage >= 50 ? 240000 : 210000,
     temperature: 0.2,
   };
 }
