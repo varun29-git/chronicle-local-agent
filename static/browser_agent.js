@@ -3,7 +3,7 @@
  * Powered by Gemma 3n MatFormer via Transformers.js
  */
 
-const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
+const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 const MODEL_ID = "onnx-community/gemma-3n-E2B-it-ONNX";
 
 let generatorPipeline = null;
@@ -78,7 +78,7 @@ export async function initializeAgent() {
   console.log(`[Agent] Allocating MatFormer Submodel: ${sliceProfile.percentage}% (Slice ${sliceProfile.num_slices}/8) via ${sliceProfile.backend}`);
 
   // Dynamically import Transformers.js
-  const { pipeline, env } = await import(TRANSFORMERS_CDN);
+  const { AutoModelForImageTextToText, AutoProcessor, env } = await import(TRANSFORMERS_CDN);
 
   // Configure environment for local browser execution (bypassing HF Token gates)
   env.allowRemoteModels = false;
@@ -91,9 +91,12 @@ export async function initializeAgent() {
   }
 
   // Initialize the text-generation pipeline with the calculated slices
-  generatorPipeline = await pipeline("text-generation", MODEL_ID, {
+  const processor = await AutoProcessor.from_pretrained(MODEL_ID);
+  const model = await AutoModelForImageTextToText.from_pretrained(MODEL_ID, {
     device: sliceProfile.backend,
     dtype: {
+      audio_encoder: "q4",
+      vision_encoder: "uint8",
       decoder_model_merged: "q4",
       embed_tokens: "q4",
     },
@@ -101,6 +104,7 @@ export async function initializeAgent() {
       num_slices: sliceProfile.num_slices,
     },
   });
+  generatorPipeline = { processor, model };
 
   console.log(`[Agent] Gemma 3n ready (${sliceProfile.percentage}% slice active).`);
   return generatorPipeline;
@@ -117,16 +121,34 @@ export async function generateNewsletter(prompt) {
   console.log("[Agent] Processing user request locally...");
 
   // Execute inference on the device seamlessly
-  const output = await generatorPipeline(prompt, {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: prompt,
+        },
+      ],
+    },
+  ];
+  const formattedPrompt = generatorPipeline.processor.apply_chat_template(messages, {
+    add_generation_prompt: true,
+  });
+  const inputs = await generatorPipeline.processor(formattedPrompt, null, null, {
+    add_special_tokens: false,
+  });
+  const inputLength = inputs.input_ids?.dims?.at(-1);
+  const output = await generatorPipeline.model.generate({
+    ...inputs,
     max_new_tokens: 1500, // Reasonable cap for newsletter bodies
     do_sample: false, // Greedy decoding for logical newsletters
-    temperature: 0.2, // Low temp, analytical writing
-    return_full_text: false,
   });
 
-  const generatedText = Array.isArray(output) && output[0]?.generated_text
-    ? output[0].generated_text
-    : output?.generated_text || String(output);
+  const generatedText = generatorPipeline.processor.batch_decode(
+    output.slice(null, [inputLength, null]),
+    { skip_special_tokens: true },
+  )[0];
 
   return {
     status: "success",

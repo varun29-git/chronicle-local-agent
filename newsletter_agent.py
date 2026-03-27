@@ -822,22 +822,49 @@ def detect_browser_model_precision(model_path):
     if not os.path.isdir(onnx_root):
         return "", {}
 
-    precision_pairs = (
+    decoder_precision_pairs = (
         ("q4", "decoder_model_merged_q4.onnx", "embed_tokens_q4.onnx"),
         ("q4f16", "decoder_model_merged_q4f16.onnx", "embed_tokens_q4f16.onnx"),
         ("quantized", "decoder_model_merged_quantized.onnx", "embed_tokens_quantized.onnx"),
         ("uint8", "decoder_model_merged_uint8.onnx", "embed_tokens_uint8.onnx"),
     )
-    for precision, decoder_name, embedding_name in precision_pairs:
+    dtype_map = {}
+    preferred_precision = ""
+
+    for precision, decoder_name, embedding_name in decoder_precision_pairs:
         if os.path.exists(os.path.join(onnx_root, decoder_name)) and os.path.exists(
             os.path.join(onnx_root, embedding_name)
         ):
-            return precision, {
-                "decoder_model_merged": precision,
-                "embed_tokens": precision,
-            }
+            preferred_precision = precision
+            dtype_map["decoder_model_merged"] = precision
+            dtype_map["embed_tokens"] = precision
+            break
 
-    return "", {}
+    auxiliary_component_precisions = {
+        "audio_encoder": ("q4f16", "q4", "int8", "uint8", "quantized", "fp16", "fp32"),
+        "vision_encoder": ("uint8", "int8", "quantized", "fp16", "fp32"),
+    }
+    for component_name, precision_order in auxiliary_component_precisions.items():
+        selected_precision = detect_onnx_component_precision(
+            onnx_root,
+            component_name,
+            precision_order,
+        )
+        if selected_precision:
+            dtype_map[component_name] = selected_precision
+
+    return preferred_precision, dtype_map
+
+
+def detect_onnx_component_precision(onnx_root, component_name, precision_order):
+    for precision in precision_order:
+        if precision == "fp32":
+            filename = f"{component_name}.onnx"
+        else:
+            filename = f"{component_name}_{precision}.onnx"
+        if os.path.exists(os.path.join(onnx_root, filename)):
+            return precision
+    return ""
 
 
 def format_slice_label(slice_ratio):

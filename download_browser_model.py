@@ -55,6 +55,10 @@ PRECISION_CANDIDATES = (
         ),
     ),
 )
+AUXILIARY_COMPONENTS = {
+    "audio_encoder": ("q4f16", "q4", "int8", "uint8", "quantized", "fp16", "fp32"),
+    "vision_encoder": ("uint8", "int8", "quantized", "fp16", "fp32"),
+}
 
 
 def main():
@@ -118,6 +122,10 @@ def build_allow_patterns(repo_files, requested_precision):
     if not selected_precision:
         raise SystemExit("No supported ONNX precision set was found in the repo.")
 
+    for component_name, precision_order in AUXILIARY_COMPONENTS.items():
+        auxiliary_files = collect_component_files(repo_files, component_name, precision_order)
+        allow_patterns.extend(auxiliary_files)
+
     return selected_precision, sorted(dict.fromkeys(allow_patterns))
 
 
@@ -138,6 +146,24 @@ def collect_precision_files(repo_files, precision_name):
                 matched_files = []
                 break
         return sorted(dict.fromkeys(matched_files))
+    return []
+
+
+def collect_component_files(repo_files, component_name, precision_order):
+    for precision in precision_order:
+        if precision == "fp32":
+            base_file = f"onnx/{component_name}.onnx"
+        else:
+            base_file = f"onnx/{component_name}_{precision}.onnx"
+
+        matched_files = [
+            file_name
+            for file_name in repo_files
+            if file_name == base_file or file_name.startswith(f"{base_file}_")
+        ]
+        if matched_files:
+            return sorted(dict.fromkeys(matched_files))
+
     return []
 
 

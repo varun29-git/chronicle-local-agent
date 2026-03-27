@@ -1,4 +1,4 @@
-const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
+const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 
 const state = {
   runs: [],
@@ -316,7 +316,7 @@ async function ensureBrowserSession() {
     throw new Error("No local browser model bundle is available on this server.");
   }
 
-  const { pipeline, env } = await import(TRANSFORMERS_CDN);
+  const { AutoModelForImageTextToText, AutoProcessor, env } = await import(TRANSFORMERS_CDN);
   env.allowRemoteModels = false;
   env.allowLocalModels = true;
   env.localModelPath = "/models";
@@ -332,9 +332,14 @@ async function ensureBrowserSession() {
         status: "running",
         message: `Loading ${candidate.label} on this device`,
       });
-      const generator = await pipeline("text-generation", candidate.model, candidate.pipelineOptions);
+      const processor = await AutoProcessor.from_pretrained(candidate.model);
+      const model = await AutoModelForImageTextToText.from_pretrained(
+        candidate.model,
+        candidate.modelOptions,
+      );
       state.browserSession = {
-        generator,
+        processor,
+        model,
         profile: candidate,
       };
       return state.browserSession;
@@ -348,24 +353,44 @@ async function ensureBrowserSession() {
 }
 
 async function generateNewsletterMarkdown(research, aiSession) {
-  const prompt = buildNewsletterPrompt(research);
-  const output = await aiSession.generator(prompt, {
+  const messages = [
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: buildNewsletterPrompt(research),
+        },
+      ],
+    },
+  ];
+  const prompt = aiSession.processor.apply_chat_template(messages, {
+    add_generation_prompt: true,
+  });
+  const inputs = await aiSession.processor(prompt, null, null, {
+    add_special_tokens: false,
+  });
+  const inputLength = inputs.input_ids?.dims?.at(-1);
+
+  if (!inputLength) {
+    throw new Error("Gemma 3n processor did not return input ids for generation.");
+  }
+
+  const output = await aiSession.model.generate({
+    ...inputs,
     max_new_tokens: aiSession.profile.maxNewTokens,
     do_sample: false,
-    temperature: aiSession.profile.temperature,
-    return_full_text: false,
   });
+  const generatedTokens = output.slice(null, [inputLength, null]);
+  const decoded = aiSession.processor.batch_decode(generatedTokens, {
+    skip_special_tokens: true,
+  });
+  const generatedText = Array.isArray(decoded) ? decoded[0] : decoded;
 
-  if (Array.isArray(output) && output[0]?.generated_text) {
-    return output[0].generated_text;
+  if (!generatedText) {
+    throw new Error("Browser model returned an empty response.");
   }
-  if (typeof output === "string") {
-    return output;
-  }
-  if (output?.generated_text) {
-    return output.generated_text;
-  }
-  throw new Error("Browser model returned an unexpected output shape.");
+  return generatedText;
 }
 
 function buildNewsletterPrompt(research) {
@@ -686,14 +711,14 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
   const maxNewTokens = device === "webgpu"
     ? Math.max(480, recommendedProfile.maxNewTokens - Math.max(recommendedProfile.sliceCount - normalizedSliceCount, 0) * 80)
     : Math.min(420, recommendedProfile.maxNewTokens);
-  const pipelineOptions = { device };
+  const modelOptions = { device };
 
   if (browserConfig.dtype_map && Object.keys(browserConfig.dtype_map).length) {
-    pipelineOptions.dtype = browserConfig.dtype_map;
+    modelOptions.dtype = browserConfig.dtype_map;
   }
 
   if (supportsSlicing) {
-    pipelineOptions.model_kwargs = { num_slices: normalizedSliceCount };
+    modelOptions.model_kwargs = { num_slices: normalizedSliceCount };
   }
 
   return {
@@ -705,7 +730,7 @@ function buildBrowserCandidate(browserConfig, device, sliceCount, recommendedPro
     percentage,
     maxNewTokens,
     temperature: recommendedProfile.temperature,
-    pipelineOptions,
+    modelOptions,
   };
 }
 

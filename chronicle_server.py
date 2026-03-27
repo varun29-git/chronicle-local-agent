@@ -213,6 +213,7 @@ class ChronicleHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", guessed_type)
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if send_body:
             self.wfile.write(content)
@@ -320,7 +321,7 @@ def build_browser_ai_snapshot():
     browser_model = newsletter_agent.describe_browser_model()
     return {
         "provider": "@huggingface/transformers",
-        "transformers_js_version": "3.7.2",
+        "transformers_js_version": "next",
         "preferred_backend": "webgpu",
         "fallback_backend": "wasm",
         "allow_remote_models": False,
