@@ -484,6 +484,11 @@ async function generateNewsletter(aiSession, run) {
     setStageState("newsletter", "active", `Fallback complete${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
     run.writeTimings.fallbackMs = Math.round(performance.now() - fallbackStartedAt);
   }
+  if (!generatedMarkdown) {
+    updateTurnStatus("Generating newsletter (rescue pass)");
+    setStageState("newsletter", "active", `Rescue pass${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
+    generatedMarkdown = await generateRescueNewsletter(aiSession, run, frame);
+  }
   if (generatedMarkdown && shouldRunPolishPass(generatedMarkdown)) {
     updateTurnStatus("Generating newsletter (final edit pass)");
     setStageState("newsletter", "active", `Final edit pass${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
@@ -511,6 +516,56 @@ async function generateNewsletter(aiSession, run) {
     storageKey,
     downloadName: `${slugify(title)}-editable.html`,
   };
+}
+
+async function generateRescueNewsletter(aiSession, run, frame) {
+  const evidence = (run.selectedSummaries?.length ? run.selectedSummaries : run.resultSummaries).slice(0, 4);
+  const summaryLines = evidence
+    .map((summary, index) => (
+      `[${index + 1}] ${trimText(summary.source_title, 84)}\n` +
+      `summary: ${trimText(summary.summary, 96)}\n` +
+      `signal: ${trimText(summary.signal, 52)}`
+    ))
+    .join("\n\n");
+
+  const promptText = [
+    "Write one complete markdown newsletter from the evidence below.",
+    `Topic: ${run.config.brief}`,
+    `Mode: ${run.config.explanation_style}`,
+    `Style instructions: ${buildPresentationInstructions(run.config)}`,
+    `Use this title: ${frame.title}`,
+    `Use this subtitle: ${frame.subtitle}`,
+    "",
+    "Evidence:",
+    summaryLines,
+    "",
+    "Format:",
+    "- H1 title",
+    "- italic subtitle",
+    "- opening paragraph",
+    "- three H2 sections with original headings",
+    "- inline citations like [1]",
+    "- markdown only",
+  ].join("\n");
+
+  try {
+    const prepared = await preparePromptInputs(aiSession, promptText);
+    if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      return "";
+    }
+    const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
+      maxNewTokens: aiTokenBudget(run, 740),
+      timeoutMs: aiTimeoutBudget(run, 150000),
+      doSample: true,
+      temperature: 0.74,
+      topP: 0.92,
+    });
+    const cleaned = stripMarkdownFences(generatedText).trim();
+    return isUsableNewsletterMarkdown(cleaned, frame) ? cleaned : "";
+  } catch (error) {
+    console.warn("[Chronicle] Rescue newsletter generation failed.", error);
+    return "";
+  }
 }
 
 function buildNewsletterPromptVariants(run, frame) {
@@ -1513,7 +1568,7 @@ async function ensureBrowserSession() {
     .then((session) => {
       state.browserSession = session;
       state.browserRuntimeStatus = "ready";
-      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} Gemma 3n · ${session.profile.label} · ${runtimeLabelForSession(session)}`;
+      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} Gemma 3n · ${session.profile.label} · num_slices=${session.profile.sliceCount} · ${runtimeLabelForSession(session)}`;
       state.browserRuntimeProgress = 1;
       state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
       renderHeaderStatus();
@@ -1632,21 +1687,28 @@ function detectBrowserCapabilities() {
     deviceMemory,
     hardwareConcurrency,
     isMobile,
+    availableMemoryGiB: estimateAvailableMemoryGiB(),
   };
 }
 
 function calculateBrowserProfile(config) {
-  const maxSlices = 16;
+  const maxSlices = 20;
   let sliceCount = 1;
+  const availableGiB = config.availableMemoryGiB || 0;
+  const effectiveGiB = availableGiB > 0
+    ? Math.max(1, Math.floor(Math.max(0, availableGiB - 1.5) * 0.75))
+    : config.deviceMemory;
 
   if (config.hasWebGPU) {
     if (config.isMobile) {
-      sliceCount = config.deviceMemory >= 8 ? 3 : 2;
-    } else if (config.deviceMemory >= 24 && config.hardwareConcurrency >= 12) {
+      sliceCount = effectiveGiB >= 8 ? 4 : effectiveGiB >= 5 ? 3 : 2;
+    } else if (effectiveGiB >= 18 && config.hardwareConcurrency >= 12) {
+      sliceCount = 10;
+    } else if (effectiveGiB >= 12 && config.hardwareConcurrency >= 10) {
       sliceCount = 8;
-    } else if (config.deviceMemory >= 16 && config.hardwareConcurrency >= 10) {
+    } else if (effectiveGiB >= 8 && config.hardwareConcurrency >= 8) {
       sliceCount = 6;
-    } else if (config.deviceMemory >= 8 && config.hardwareConcurrency >= 8) {
+    } else if (effectiveGiB >= 5) {
       sliceCount = 4;
     }
   }
@@ -1659,6 +1721,8 @@ function calculateBrowserProfile(config) {
     sliceCount,
     percentage,
     label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
+    availableMemoryGiB: availableGiB,
+    reservedMemoryGiB: availableGiB > 0 ? Math.max(0, availableGiB - effectiveGiB) : 0,
     maxInputTokens: percentage >= 50 ? 1500 : percentage >= 25 ? 1240 : 980,
     maxNewTokens: percentage >= 50 ? 900 : percentage >= 25 ? 760 : 620,
     generationTimeoutMs: config.hasWebGPU ? 240000 : 300000,
@@ -2723,6 +2787,24 @@ function formatEta(milliseconds) {
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function estimateAvailableMemoryGiB() {
+  try {
+    const perfMemory = performance?.memory;
+    if (!perfMemory) {
+      return 0;
+    }
+    const limit = Number(perfMemory.jsHeapSizeLimit || 0);
+    const used = Number(perfMemory.usedJSHeapSize || 0);
+    if (!limit || !Number.isFinite(limit)) {
+      return 0;
+    }
+    const freeBytes = Math.max(0, limit - used);
+    return Number((freeBytes / (1024 ** 3)).toFixed(2));
+  } catch (_error) {
+    return 0;
+  }
 }
 
 function withTimeout(promise, timeoutMs, message) {
