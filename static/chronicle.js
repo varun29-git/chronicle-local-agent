@@ -3,6 +3,7 @@ const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers
 const MODEL_CANDIDATES = [
   "onnx-community/Qwen3-0.6B-ONNX",
 ];
+const NON_GEMMA_DTYPE = "q4f16";
 
 const GEMMA3N_DTYPE_MAP = {
   decoder_model_merged: "q4",
@@ -22,8 +23,8 @@ function isGemma3nModel(modelId) {
 
 const DEPTH_CONFIG = {
   low: { queryCount: 2, resultsPerQuery: 2, summarizeCount: 3 },
-  medium: { queryCount: 4, resultsPerQuery: 3, summarizeCount: 6 },
-  high: { queryCount: 6, resultsPerQuery: 4, summarizeCount: 8 },
+  medium: { queryCount: 2, resultsPerQuery: 2, summarizeCount: 3 },
+  high: { queryCount: 3, resultsPerQuery: 3, summarizeCount: 4 },
 };
 
 const TURN_STAGES = [
@@ -44,16 +45,16 @@ const WRITER_POLICY = {
   name: "balanced_fast",
   openingEvidenceCount: 2,
   sectionEvidenceCount: 2,
-  openingMaxTokens: 180,
-  sectionMaxTokens: 260,
+  openingMaxTokens: 120,
+  sectionMaxTokens: 150,
   fallbackVariantChars: [120, 84],
   fallbackTimeoutMs: 55000,
-  fallbackMaxTokens: { medium: 520, compact: 460 },
+  fallbackMaxTokens: { medium: 260, compact: 220 },
   polishOnPassOnly: true,
-  polishMaxTokens: 520,
+  polishMaxTokens: 260,
   polishTimeoutMs: 50000,
-  openingAttemptTimeoutMs: 22000,
-  sectionAttemptTimeoutMs: 22000,
+  openingAttemptTimeoutMs: 18000,
+  sectionAttemptTimeoutMs: 18000,
 };
 
 const state = {
@@ -233,7 +234,7 @@ async function runBrowserPipeline(payload) {
   };
 
   state.activeStageKey = "query";
-  updateTurnStatus("Loading Chronicle brain");
+  updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
   setStageState("query", "active", getWarmupProgressLabel());
   const aiSession = await waitForBrowserSessionReady();
   updateTurnStatus("Generating search queries");
@@ -1576,7 +1577,10 @@ async function ensureBrowserSession() {
     .then((session) => {
       state.browserSession = session;
       state.browserRuntimeStatus = "ready";
-      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} local model · ${session.profile.label} · num_slices=${session.profile.sliceCount} · ${runtimeLabelForSession(session)}`;
+      const sliceMeta = session.profile?.hasSlices
+        ? ` · ${session.profile.label} · num_slices=${session.profile.sliceCount}`
+        : "";
+      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} local model${sliceMeta} · ${runtimeLabelForSession(session)}`;
       state.browserRuntimeProgress = 1;
       state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
       renderHeaderStatus();
@@ -1624,6 +1628,9 @@ async function loadBrowserSession() {
 }
 
 function getCandidateLoadTimeoutMs(candidate) {
+  if (!candidate?.hasSlices && candidate?.device === "wasm") {
+    return 180000;
+  }
   if (candidate?.device === "webgpu") {
     return 150000;
   }
@@ -1778,17 +1785,23 @@ function calculateBrowserProfile(config) {
 function buildBrowserCandidates() {
   const candidates = [];
   const baseProfile = state.browserProfile || calculateBrowserProfile(state.browserCapabilities || detectBrowserCapabilities());
-  const sliceFallbacks = buildSliceFallbackChain(baseProfile.sliceCount, baseProfile.maxSlices);
 
   MODEL_CANDIDATES.forEach((modelId) => {
-    if (state.browserCapabilities.hasWebGPU) {
-      sliceFallbacks.forEach((sliceCount) => {
-        candidates.push(buildBrowserCandidate(modelId, "webgpu", sliceCount, baseProfile));
+    if (isGemma3nModel(modelId)) {
+      const sliceFallbacks = buildSliceFallbackChain(baseProfile.sliceCount, baseProfile.maxSlices);
+      if (state.browserCapabilities.hasWebGPU) {
+        sliceFallbacks.forEach((sliceCount) => {
+          candidates.push(buildBrowserCandidate(modelId, "webgpu", sliceCount, baseProfile));
+        });
+      }
+      buildSliceFallbackChain(Math.min(baseProfile.sliceCount, 2), baseProfile.maxSlices).forEach((sliceCount) => {
+        candidates.push(buildBrowserCandidate(modelId, "wasm", sliceCount, baseProfile));
       });
+      return;
     }
-    buildSliceFallbackChain(Math.min(baseProfile.sliceCount, 2), baseProfile.maxSlices).forEach((sliceCount) => {
-      candidates.push(buildBrowserCandidate(modelId, "wasm", sliceCount, baseProfile));
-    });
+
+    // Keep non-Gemma runtime simple and stable: single WASM candidate.
+    candidates.push(buildBrowserCandidate(modelId, "wasm", 1, baseProfile));
   });
 
   return dedupeCandidates(candidates);
@@ -1796,25 +1809,27 @@ function buildBrowserCandidates() {
 
 function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
   const sliceLabel = `${Math.round((sliceCount / baseProfile.maxSlices) * 100)}% slice (${sliceCount}/${baseProfile.maxSlices})`;
-  const textModelOptions = isGemma3nModel(modelId)
+  const hasSlices = isGemma3nModel(modelId);
+  const textModelOptions = hasSlices
     ? {
       device,
       dtype: GEMMA3N_TEXT_DTYPE_MAP,
       model_kwargs: { num_slices: sliceCount },
     }
-    : { device };
-  const multimodalModelOptions = isGemma3nModel(modelId)
+    : { device, dtype: NON_GEMMA_DTYPE };
+  const multimodalModelOptions = hasSlices
     ? {
       device,
       dtype: GEMMA3N_DTYPE_MAP,
       model_kwargs: { num_slices: sliceCount },
     }
-    : { device };
+    : { device, dtype: NON_GEMMA_DTYPE };
 
   return {
     device,
     model: modelId,
-    label: `${device === "webgpu" ? "WebGPU" : "WASM"} ${sliceLabel}`,
+    label: hasSlices ? `${device === "webgpu" ? "WebGPU" : "WASM"} ${sliceLabel}` : `${device === "webgpu" ? "WebGPU" : "WASM"}`,
+    hasSlices,
     sliceCount,
     maxInputTokens: device === "webgpu"
       ? Math.max(900, baseProfile.maxInputTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 120)
@@ -1880,9 +1895,6 @@ async function waitForBrowserSessionReady() {
 
     advanceWarmupTailProgress();
     const now = Date.now();
-    if (isWarmupHardStalled()) {
-      throw new Error("Model warmup stalled near completion. Chronicle is retrying lighter runtime profiles. If this repeats, refresh and retry.");
-    }
     if (now - (state.lastWarmupUiUpdateAt || 0) >= 800) {
       const detail = getWarmupProgressLabel();
       updateTurnStatus(`Loading Chronicle brain (${detail})`);
@@ -1892,15 +1904,6 @@ async function waitForBrowserSessionReady() {
       state.lastWarmupUiUpdateAt = now;
     }
   }
-}
-
-function isWarmupHardStalled() {
-  if (state.browserRuntimeStatus !== "warming") {
-    return false;
-  }
-  const progress = Number(state.browserRuntimeProgress || 0);
-  const stalledForMs = Date.now() - (state.browserLastProgressAt || Date.now());
-  return progress >= 0.985 && stalledForMs >= 90000;
 }
 
 function beginBrowserLoad(candidate) {
