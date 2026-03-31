@@ -325,8 +325,8 @@ async function generateSearchPlan(aiSession, payload, queryCount) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
-        maxNewTokens: 140,
-        timeoutMs: 90000,
+        maxNewTokens: 72,
+        timeoutMs: 45000,
       });
       lastText = generatedText;
       const plan = parseSearchPlanText(generatedText, queryCount, payload.brief);
@@ -447,8 +447,8 @@ async function summarizeSearchResult(aiSession, rawResult) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
-        maxNewTokens: 160,
-        timeoutMs: 90000,
+        maxNewTokens: 90,
+        timeoutMs: 45000,
       });
       lastText = generatedText;
       const summary = parseResultSummaryText(generatedText, rawResult);
@@ -1831,15 +1831,21 @@ function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
     label: hasSlices ? `${device === "webgpu" ? "WebGPU" : "WASM"} ${sliceLabel}` : `${device === "webgpu" ? "WebGPU" : "WASM"}`,
     hasSlices,
     sliceCount,
-    maxInputTokens: device === "webgpu"
-      ? Math.max(900, baseProfile.maxInputTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 120)
-      : Math.min(900, baseProfile.maxInputTokens),
-    maxNewTokens: device === "webgpu"
-      ? Math.max(560, baseProfile.maxNewTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 40)
-      : Math.min(620, baseProfile.maxNewTokens),
-    generationTimeoutMs: device === "webgpu"
-      ? Math.max(120000, baseProfile.generationTimeoutMs - Math.max(baseProfile.sliceCount - sliceCount, 0) * 15000)
-      : Math.max(180000, baseProfile.generationTimeoutMs),
+    maxInputTokens: hasSlices
+      ? (device === "webgpu"
+        ? Math.max(900, baseProfile.maxInputTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 120)
+        : Math.min(900, baseProfile.maxInputTokens))
+      : 560,
+    maxNewTokens: hasSlices
+      ? (device === "webgpu"
+        ? Math.max(560, baseProfile.maxNewTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 40)
+        : Math.min(620, baseProfile.maxNewTokens))
+      : 120,
+    generationTimeoutMs: hasSlices
+      ? (device === "webgpu"
+        ? Math.max(120000, baseProfile.generationTimeoutMs - Math.max(baseProfile.sliceCount - sliceCount, 0) * 15000)
+        : Math.max(180000, baseProfile.generationTimeoutMs))
+      : 70000,
     textModelOptions,
     multimodalModelOptions,
   };
