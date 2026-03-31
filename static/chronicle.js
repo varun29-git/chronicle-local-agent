@@ -1,7 +1,7 @@
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 
 const MODEL_CANDIDATES = [
-  "onnx-community/gemma-3n-E2B-it-ONNX",
+  "XformAI-india/qwen-0.6b-reasoning",
 ];
 
 const GEMMA3N_DTYPE_MAP = {
@@ -15,6 +15,10 @@ const GEMMA3N_TEXT_DTYPE_MAP = {
   decoder_model_merged: "q4",
   embed_tokens: "q4",
 };
+
+function isGemma3nModel(modelId) {
+  return String(modelId || "").toLowerCase().includes("gemma-3n");
+}
 
 const DEPTH_CONFIG = {
   low: { queryCount: 2, resultsPerQuery: 2, summarizeCount: 3 },
@@ -1608,11 +1612,11 @@ async function loadBrowserSession() {
     }
   }
 
-  throw new Error(lastError?.message || "No local Gemma 3n browser bundle could be initialized.");
+  throw new Error(lastError?.message || "No local browser model bundle could be initialized.");
 }
 
 async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) {
-  state.browserRuntimeMessage = `Local Gemma 3n text runtime · ${candidate.label}`;
+  state.browserRuntimeMessage = `Local model text runtime · ${candidate.label}`;
   state.browserRuntimeProgressText = "Opening text tokenizer…";
   renderHeaderStatus();
   const tokenizer = await runtime.AutoTokenizer.from_pretrained(candidate.model, {
@@ -1667,7 +1671,7 @@ function warmBrowserSessionInBackground() {
 
   state.browserWarmStarted = true;
   state.browserRuntimeStatus = "warming";
-  state.browserRuntimeMessage = "Preparing Gemma 3n in the browser so Chronicle can run fully on device.";
+  state.browserRuntimeMessage = "Preparing the browser model so Chronicle can run fully on device.";
   state.browserRuntimeProgressText = "Loading model files…";
   renderHeaderStatus();
   ensureBrowserSession().catch((error) => {
@@ -1750,16 +1754,20 @@ function buildBrowserCandidates() {
 
 function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
   const sliceLabel = `${Math.round((sliceCount / baseProfile.maxSlices) * 100)}% slice (${sliceCount}/${baseProfile.maxSlices})`;
-  const textModelOptions = {
-    device,
-    dtype: GEMMA3N_TEXT_DTYPE_MAP,
-    model_kwargs: { num_slices: sliceCount },
-  };
-  const multimodalModelOptions = {
-    device,
-    dtype: GEMMA3N_DTYPE_MAP,
-    model_kwargs: { num_slices: sliceCount },
-  };
+  const textModelOptions = isGemma3nModel(modelId)
+    ? {
+      device,
+      dtype: GEMMA3N_TEXT_DTYPE_MAP,
+      model_kwargs: { num_slices: sliceCount },
+    }
+    : { device };
+  const multimodalModelOptions = isGemma3nModel(modelId)
+    ? {
+      device,
+      dtype: GEMMA3N_DTYPE_MAP,
+      model_kwargs: { num_slices: sliceCount },
+    }
+    : { device };
 
   return {
     device,

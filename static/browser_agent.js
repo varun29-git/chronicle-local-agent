@@ -1,10 +1,10 @@
 /**
  * Headless Browser Agent Core
- * Powered by Gemma 3n MatFormer via Transformers.js
+ * Powered by a local Transformers.js model
  */
 
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
-const MODEL_ID = "onnx-community/gemma-3n-E2B-it-ONNX";
+const MODEL_ID = "XformAI-india/qwen-0.6b-reasoning";
 
 let generatorPipeline = null;
 let currentProfile = null;
@@ -64,6 +64,10 @@ function calculateModelSlice(config) {
   };
 }
 
+function isGemma3nModel(modelId) {
+  return String(modelId || "").toLowerCase().includes("gemma-3n");
+}
+
 /**
  * Initializes the Transformers.js pipeline with the calculated MatFormer slice configuration.
  */
@@ -92,21 +96,26 @@ export async function initializeAgent() {
 
   // Initialize the text-generation pipeline with the calculated slices
   const processor = await AutoProcessor.from_pretrained(MODEL_ID);
-  const model = await AutoModelForImageTextToText.from_pretrained(MODEL_ID, {
-    device: sliceProfile.backend,
-    dtype: {
-      audio_encoder: "q4",
-      vision_encoder: "uint8",
-      decoder_model_merged: "q4",
-      embed_tokens: "q4",
-    },
-    model_kwargs: {
-      num_slices: sliceProfile.num_slices,
-    },
-  });
+  const modelOptions = isGemma3nModel(MODEL_ID)
+    ? {
+      device: sliceProfile.backend,
+      dtype: {
+        audio_encoder: "q4",
+        vision_encoder: "uint8",
+        decoder_model_merged: "q4",
+        embed_tokens: "q4",
+      },
+      model_kwargs: {
+        num_slices: sliceProfile.num_slices,
+      },
+    }
+    : {
+      device: sliceProfile.backend,
+    };
+  const model = await AutoModelForImageTextToText.from_pretrained(MODEL_ID, modelOptions);
   generatorPipeline = { processor, model };
 
-  console.log(`[Agent] Gemma 3n ready (${sliceProfile.percentage}% slice active).`);
+  console.log(`[Agent] ${MODEL_ID} ready (${sliceProfile.percentage}% slice active).`);
   return generatorPipeline;
 }
 
