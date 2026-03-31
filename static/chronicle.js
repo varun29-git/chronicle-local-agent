@@ -243,8 +243,15 @@ async function runBrowserPipeline(payload) {
   state.activeStageKey = "query";
   updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
   setStageState("query", "active", getWarmupProgressLabel());
-  const aiSession = await waitForBrowserSessionReady();
-  await setSessionSlices(aiSession, QUERY_STAGE_SLICE_COUNT);
+  let aiSession;
+  try {
+    aiSession = await waitForBrowserSessionReady();
+    await setSessionSlices(aiSession, QUERY_STAGE_SLICE_COUNT);
+  } catch (error) {
+    console.warn("[Chronicle] Model warmup unavailable, continuing with deterministic fallback path.", error);
+    appendSystemMessage("Model runtime is unavailable right now. Chronicle will continue in deterministic fallback mode for this run.");
+    aiSession = createNoModelSession();
+  }
   updateTurnStatus("Generating search queries");
   run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
   await setSessionSlices(aiSession, aiSession.profile?.sliceCount || QUERY_STAGE_SLICE_COUNT);
@@ -256,7 +263,8 @@ async function runBrowserPipeline(payload) {
   updateTurnStatus("Fetching Google results");
   run.rawResults = await fetchAllGoogleResults(run.queryPlan.queries, config.resultsPerQuery);
   if (!run.rawResults.length) {
-    throw new Error("Google returned no readable results for this topic.");
+    appendSystemMessage("Google returned no readable results. Chronicle will continue using synthetic placeholder evidence.");
+    run.rawResults = buildSyntheticRawResults(run.queryPlan, payload, config.summarizeCount);
   }
   setStageState("search", "complete", `${run.rawResults.length} results collected`);
 
@@ -283,8 +291,8 @@ async function runBrowserPipeline(payload) {
         .filter(Boolean)
     );
     const reasonText = failureReasons.length ? ` Reasons: ${failureReasons.join(", ")}` : "";
-    throw new Error(
-      `Model is loaded but produced 0/${run.resultSummaries.length} direct summaries.${reasonText} Check the browser console for worker errors.`
+    appendSystemMessage(
+      `Model produced 0/${run.resultSummaries.length} direct summaries. Chronicle is using deterministic fallback summaries.${reasonText}`
     );
   }
   const requiredModelSummaries = Math.max(2, Math.ceil(run.resultSummaries.length * 0.45));
@@ -537,7 +545,7 @@ async function generateNewsletter(aiSession, run) {
     }
   }
   if (!generatedMarkdown) {
-    throw new Error("Chronicle's writer could not complete a full newsletter for this topic.");
+    generatedMarkdown = buildEmergencyNewsletterMarkdown(run, frame);
   }
   run.writeTimings.totalMs = Math.round(performance.now() - newsletterStartedAt);
 
@@ -2214,6 +2222,10 @@ async function preparePromptInputs(aiSession, promptText) {
 }
 
 async function generateFromPreparedInputs(aiSession, prepared, options) {
+  if (aiSession.runtimeKind === "none") {
+    throw new Error("Model runtime unavailable for this run.");
+  }
+
   if (aiSession.runtimeKind === "worker") {
     await yieldToBrowser();
     const result = await sendWorkerRequest(
@@ -2263,6 +2275,46 @@ async function generateFromPreparedInputs(aiSession, prepared, options) {
 
   await yieldToBrowser();
   return generatedText;
+}
+
+function createNoModelSession() {
+  return {
+    runtimeKind: "none",
+    profile: {
+      hasSlices: false,
+      sliceCount: 1,
+      maxSlices: 36,
+      maxInputTokens: 0,
+      maxNewTokens: 0,
+      generationTimeoutMs: 0,
+      label: "Fallback mode",
+      device: "wasm",
+      model: "",
+      textModelOptions: {},
+    },
+    activeSliceCount: 1,
+  };
+}
+
+function buildSyntheticRawResults(queryPlan, payload, count) {
+  const topic = cleanText(payload?.brief || "the requested topic");
+  const queries = Array.isArray(queryPlan?.queries) && queryPlan.queries.length
+    ? queryPlan.queries
+    : [topic];
+  const total = Math.max(1, Number(count || 1));
+  const items = [];
+  for (let index = 0; index < total; index += 1) {
+    const query = queries[index % queries.length] || topic;
+    items.push({
+      result_id: `synthetic-${index + 1}`,
+      query,
+      rank: index + 1,
+      title: `${cleanTitle(topic)} briefing placeholder`,
+      url: `local://synthetic/${index + 1}`,
+      snippet: `No live result was available for "${query}". Chronicle generated a deterministic placeholder summary from the query intent.`,
+    });
+  }
+  return items;
 }
 
 function estimatePromptTokens(promptText) {
