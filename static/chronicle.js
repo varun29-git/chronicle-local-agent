@@ -73,6 +73,8 @@ const state = {
   transformersRuntimePromise: null,
   currentTurn: null,
   activeStageKey: null,
+  autoScrollToBottom: true,
+  lastWarmupUiUpdateAt: 0,
 };
 
 const elements = {};
@@ -98,6 +100,7 @@ function cacheElements() {
   elements.explanationStyle = document.getElementById("explanation-style");
   elements.customStyleField = document.getElementById("custom-style-field");
   elements.generateButton = document.getElementById("generate-button");
+  elements.chatThread?.addEventListener("scroll", onChatThreadScroll, { passive: true });
 }
 
 function bindComposer() {
@@ -195,6 +198,7 @@ function renderHeaderStatus() {
 function startNewTurn(userPrompt) {
   appendUserMessage(userPrompt);
   elements.brief.value = "";
+  state.autoScrollToBottom = true;
   state.currentTurn = {
     statusNode: appendAssistantMessage("Generating search queries", "Stage"),
     stageNode: appendStageCard(),
@@ -1601,7 +1605,11 @@ async function loadBrowserSession() {
     try {
       beginBrowserLoad(candidate);
       const progressCallback = createBrowserLoadProgressHandler(candidate);
-      return await loadTextOnlyBrowserSession(runtime, candidate, progressCallback);
+      return await withTimeout(
+        loadTextOnlyBrowserSession(runtime, candidate, progressCallback),
+        getCandidateLoadTimeoutMs(candidate),
+        `Warmup timed out for ${candidate.label}.`,
+      );
     } catch (error) {
       lastError = error;
       state.browserRuntimeMessage = `Retrying with a lighter browser profile after ${candidate.label} failed.`;
@@ -1613,6 +1621,13 @@ async function loadBrowserSession() {
   }
 
   throw new Error(lastError?.message || "No local browser model bundle could be initialized.");
+}
+
+function getCandidateLoadTimeoutMs(candidate) {
+  if (candidate?.device === "webgpu") {
+    return 150000;
+  }
+  return 120000;
 }
 
 async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) {
@@ -1842,7 +1857,7 @@ function getBrowserWarmupTimeoutMs() {
   if (state.browserSession?.model) {
     return 15000;
   }
-  return state.browserCapabilities?.hasWebGPU ? 420000 : 540000;
+  return state.browserCapabilities?.hasWebGPU ? 240000 : 330000;
 }
 
 async function waitForBrowserSessionReady() {
@@ -1864,12 +1879,28 @@ async function waitForBrowserSessionReady() {
     }
 
     advanceWarmupTailProgress();
-    const detail = getWarmupProgressLabel();
-    updateTurnStatus(`Loading Chronicle brain (${detail})`);
-    if (state.currentTurn?.stageNode && state.activeStageKey === "query") {
-      setStageState("query", "active", detail);
+    const now = Date.now();
+    if (isWarmupHardStalled()) {
+      throw new Error("Model warmup stalled near completion. Chronicle is retrying lighter runtime profiles. If this repeats, refresh and retry.");
+    }
+    if (now - (state.lastWarmupUiUpdateAt || 0) >= 800) {
+      const detail = getWarmupProgressLabel();
+      updateTurnStatus(`Loading Chronicle brain (${detail})`);
+      if (state.currentTurn?.stageNode && state.activeStageKey === "query") {
+        setStageState("query", "active", detail);
+      }
+      state.lastWarmupUiUpdateAt = now;
     }
   }
+}
+
+function isWarmupHardStalled() {
+  if (state.browserRuntimeStatus !== "warming") {
+    return false;
+  }
+  const progress = Number(state.browserRuntimeProgress || 0);
+  const stalledForMs = Date.now() - (state.browserLastProgressAt || Date.now());
+  return progress >= 0.985 && stalledForMs >= 90000;
 }
 
 function beginBrowserLoad(candidate) {
@@ -2485,7 +2516,25 @@ function dismissEmptyState() {
   }
 }
 
-function scrollThreadToBottom() {
+function onChatThreadScroll() {
+  state.autoScrollToBottom = isChatThreadNearBottom();
+}
+
+function isChatThreadNearBottom() {
+  if (!elements.chatThread) {
+    return true;
+  }
+  const remaining = elements.chatThread.scrollHeight - elements.chatThread.scrollTop - elements.chatThread.clientHeight;
+  return remaining < 96;
+}
+
+function scrollThreadToBottom(force = false) {
+  if (!elements.chatThread) {
+    return;
+  }
+  if (!force && !state.autoScrollToBottom) {
+    return;
+  }
   elements.chatThread.scrollTop = elements.chatThread.scrollHeight;
 }
 
