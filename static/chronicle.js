@@ -76,6 +76,9 @@ const state = {
   activeStageKey: null,
   autoScrollToBottom: true,
   lastWarmupUiUpdateAt: 0,
+  modelWorker: null,
+  workerPending: new Map(),
+  workerRequestSeq: 0,
 };
 
 const elements = {};
@@ -156,6 +159,9 @@ async function hydrateApp() {
   state.browserCapabilities = detectBrowserCapabilities();
   state.browserProfile = calculateBrowserProfile(state.browserCapabilities);
   renderHeaderStatus();
+  window.setTimeout(() => {
+    warmBrowserSessionInBackground();
+  }, 150);
 }
 
 function renderHeaderStatus() {
@@ -267,8 +273,11 @@ async function runBrowserPipeline(payload) {
   }
   setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
   const modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
-  if (modelSummaryCount < Math.max(2, Math.ceil(run.resultSummaries.length * 0.45))) {
-    throw new Error("Chronicle could not produce enough model-written evidence summaries. Retry after warmup finishes.");
+  const requiredModelSummaries = Math.max(2, Math.ceil(run.resultSummaries.length * 0.45));
+  if (modelSummaryCount < requiredModelSummaries) {
+    appendSystemMessage(
+      `Model produced ${modelSummaryCount}/${run.resultSummaries.length} direct summaries this run. Chronicle will continue using fallback summaries for the rest.`
+    );
   }
   run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
 
@@ -321,7 +330,7 @@ async function generateSearchPlan(aiSession, payload, queryCount) {
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -443,7 +452,7 @@ async function summarizeSearchResult(aiSession, rawResult) {
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -559,7 +568,7 @@ async function generateRescueNewsletter(aiSession, run, frame) {
 
   try {
     const prepared = await preparePromptInputs(aiSession, promptText);
-    if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+    if (isPromptTooLongForSession(aiSession, prepared)) {
       return "";
     }
     const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -680,7 +689,7 @@ async function generateNewsletterFrame(aiSession, run) {
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -735,7 +744,7 @@ async function generateNewsletterOpening(aiSession, run, frame) {
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -767,7 +776,7 @@ async function generateNewsletterSection(aiSession, run, frame, heading, previou
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -795,7 +804,7 @@ async function generateWholeNewsletterFallback(aiSession, run, frame) {
   for (const variant of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, variant.promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
 
@@ -877,7 +886,7 @@ async function generateStructuredJson(aiSession, promptVariants, options) {
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
 
@@ -1520,7 +1529,7 @@ async function polishNewsletterDraft(aiSession, run, frame, markdownDraft) {
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      if (!prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens) {
+      if (isPromptTooLongForSession(aiSession, prepared)) {
         continue;
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
@@ -1565,7 +1574,7 @@ function buildPolishPrompt(run, frame, markdownDraft, compact) {
 }
 
 async function ensureBrowserSession() {
-  if (state.browserSession?.model) {
+  if (state.browserSession?.worker) {
     return state.browserSession;
   }
 
@@ -1580,7 +1589,7 @@ async function ensureBrowserSession() {
       const sliceMeta = session.profile?.hasSlices
         ? ` · ${session.profile.label} · num_slices=${session.profile.sliceCount}`
         : "";
-      state.browserRuntimeMessage = `${session.runtimeKind === "text" ? "Text-only" : "Multimodal"} local model${sliceMeta} · ${runtimeLabelForSession(session)}`;
+      state.browserRuntimeMessage = `${session.runtimeKind === "worker" || session.runtimeKind === "text" ? "Text-only" : "Multimodal"} local model${sliceMeta} · ${runtimeLabelForSession(session)}`;
       state.browserRuntimeProgress = 1;
       state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
       renderHeaderStatus();
@@ -1601,7 +1610,6 @@ async function ensureBrowserSession() {
 }
 
 async function loadBrowserSession() {
-  const runtime = await loadTransformersRuntime();
   const candidates = buildBrowserCandidates();
   let lastError = null;
 
@@ -1610,12 +1618,13 @@ async function loadBrowserSession() {
       beginBrowserLoad(candidate);
       const progressCallback = createBrowserLoadProgressHandler(candidate);
       return await withTimeout(
-        loadTextOnlyBrowserSession(runtime, candidate, progressCallback),
+        loadTextOnlyBrowserSession(candidate, progressCallback),
         getCandidateLoadTimeoutMs(candidate),
         `Warmup timed out for ${candidate.label}.`,
       );
     } catch (error) {
       lastError = error;
+      resetModelWorker();
       state.browserRuntimeMessage = `Retrying with a lighter browser profile after ${candidate.label} failed.`;
       state.browserRuntimeProgressText = "Switching runtime profile…";
       state.browserRuntimeProgress = 0.08;
@@ -1628,6 +1637,9 @@ async function loadBrowserSession() {
 }
 
 function getCandidateLoadTimeoutMs(candidate) {
+  if (!candidate?.hasSlices && candidate?.device === "webgpu") {
+    return 60000;
+  }
   if (!candidate?.hasSlices && candidate?.device === "wasm") {
     return 180000;
   }
@@ -1637,39 +1649,88 @@ function getCandidateLoadTimeoutMs(candidate) {
   return 120000;
 }
 
-async function loadTextOnlyBrowserSession(runtime, candidate, progressCallback) {
+async function loadTextOnlyBrowserSession(candidate, progressCallback) {
   state.browserRuntimeMessage = `Local model text runtime · ${candidate.label}`;
   state.browserRuntimeProgressText = "Opening text tokenizer…";
   renderHeaderStatus();
   await assertLocalModelBundleReady(candidate.model);
-  let tokenizer;
-  try {
-    tokenizer = await runtime.AutoTokenizer.from_pretrained(candidate.model, {
-      progress_callback: progressCallback,
-    });
-  } catch (error) {
-    const message = String(error?.message || error || "");
-    if (message.includes("tokenizer_class")) {
-      throw new Error(
-        `Local model bundle for "${candidate.model}" is missing tokenizer metadata. Ensure /models/${candidate.model} contains a valid config/tokenizer for Transformers.js.`
-      );
-    }
-    throw error;
-  }
-  if (typeof tokenizer.apply_chat_template !== "function") {
-    throw new Error("Text tokenizer does not expose chat templates for the selected local model.");
-  }
-  const model = await runtime.AutoModelForCausalLM.from_pretrained(candidate.model, {
-    ...candidate.textModelOptions,
-    progress_callback: progressCallback,
-  });
+  const worker = getOrCreateModelWorker(progressCallback);
+  await sendWorkerRequest("init", {
+    model: candidate.model,
+    device: candidate.device,
+    dtype: NON_GEMMA_DTYPE,
+    localModelPath: "/models",
+    numThreads: Math.min(4, navigator.hardwareConcurrency || 2),
+  }, Math.max(60000, getCandidateLoadTimeoutMs(candidate)));
   return {
-    runtimeKind: "text",
-    codec: tokenizer,
-    tokenizer,
-    model,
+    runtimeKind: "worker",
+    worker,
     profile: candidate,
   };
+}
+
+function getOrCreateModelWorker(progressCallback) {
+  if (state.modelWorker) {
+    return state.modelWorker;
+  }
+
+  const worker = new Worker("/static/chronicle_worker.js", { type: "module" });
+  worker.onmessage = (event) => {
+    const payload = event.data || {};
+    if (payload.type === "progress") {
+      progressCallback(payload.progress || {});
+      return;
+    }
+    if (payload.type === "error" && !payload.id) {
+      console.error("[Chronicle] Worker error:", payload.message || "Unknown worker error");
+      return;
+    }
+    if (!payload.id) {
+      return;
+    }
+    const pending = state.workerPending.get(payload.id);
+    if (!pending) {
+      return;
+    }
+    state.workerPending.delete(payload.id);
+    if (payload.type === "result" || payload.type === "ready") {
+      pending.resolve(payload);
+      return;
+    }
+    pending.reject(new Error(payload.message || "Worker request failed."));
+  };
+  worker.onerror = (event) => {
+    console.error("[Chronicle] Worker crashed.", event);
+  };
+
+  state.modelWorker = worker;
+  return worker;
+}
+
+function resetModelWorker() {
+  if (state.modelWorker) {
+    state.modelWorker.terminate();
+  }
+  state.modelWorker = null;
+  state.workerPending = new Map();
+}
+
+function sendWorkerRequest(type, payload, timeoutMs = 90000) {
+  if (!state.modelWorker) {
+    throw new Error("Chronicle worker is not initialized.");
+  }
+  const id = `req-${++state.workerRequestSeq}`;
+  const responsePromise = new Promise((resolve, reject) => {
+    state.workerPending.set(id, { resolve, reject });
+  });
+  state.modelWorker.postMessage({ type, id, ...payload });
+  return withTimeout(
+    responsePromise,
+    timeoutMs,
+    `Worker request timed out for ${type}.`,
+  ).finally(() => {
+    state.workerPending.delete(id);
+  });
 }
 
 async function assertLocalModelBundleReady(modelId) {
@@ -1800,7 +1861,10 @@ function buildBrowserCandidates() {
       return;
     }
 
-    // Keep non-Gemma runtime simple and stable: single WASM candidate.
+    // For non-Gemma, try WebGPU first for faster warmup on capable devices, then fallback to WASM.
+    if (state.browserCapabilities.hasWebGPU) {
+      candidates.push(buildBrowserCandidate(modelId, "webgpu", 1, baseProfile));
+    }
     candidates.push(buildBrowserCandidate(modelId, "wasm", 1, baseProfile));
   });
 
@@ -1875,7 +1939,7 @@ function dedupeCandidates(candidates) {
 }
 
 function getBrowserWarmupTimeoutMs() {
-  if (state.browserSession?.model) {
+  if (state.browserSession?.worker) {
     return 15000;
   }
   return state.browserCapabilities?.hasWebGPU ? 240000 : 330000;
@@ -2019,6 +2083,14 @@ function getWarmupProgressLabel() {
 }
 
 async function preparePromptInputs(aiSession, promptText) {
+  if (aiSession.runtimeKind === "worker") {
+    return {
+      prompt: promptText,
+      inputs: null,
+      inputLength: estimatePromptTokens(promptText),
+    };
+  }
+
   const messages = aiSession.runtimeKind === "text"
     ? [
       {
@@ -2048,6 +2120,29 @@ async function preparePromptInputs(aiSession, promptText) {
 }
 
 async function generateFromPreparedInputs(aiSession, prepared, options) {
+  if (aiSession.runtimeKind === "worker") {
+    await yieldToBrowser();
+    const result = await sendWorkerRequest(
+      "generate",
+      {
+        prompt: prepared.prompt,
+        maxNewTokens: options.maxNewTokens || aiSession.profile.maxNewTokens,
+        timeoutMs: options.timeoutMs || aiSession.profile.generationTimeoutMs,
+        doSample: Boolean(options.doSample),
+        temperature: options.doSample ? options.temperature || 0.7 : undefined,
+        topP: options.doSample ? options.topP || 0.92 : undefined,
+        repetitionPenalty: options.repetitionPenalty || 1.08,
+      },
+      options.timeoutMs || aiSession.profile.generationTimeoutMs,
+    );
+    const generatedText = cleanText(result.text || "");
+    if (!generatedText) {
+      throw new Error("The browser model returned an empty response.");
+    }
+    await yieldToBrowser();
+    return generatedText;
+  }
+
   await yieldToBrowser();
   const output = await withTimeout(
     aiSession.model.generate({
@@ -2074,6 +2169,23 @@ async function generateFromPreparedInputs(aiSession, prepared, options) {
 
   await yieldToBrowser();
   return generatedText;
+}
+
+function estimatePromptTokens(promptText) {
+  const text = cleanText(promptText);
+  if (!text) {
+    return 0;
+  }
+  const words = text.split(/\s+/).length;
+  return Math.ceil(words * 1.4);
+}
+
+function isPromptTooLongForSession(aiSession, prepared) {
+  if (aiSession?.runtimeKind === "worker") {
+    // Worker mode uses an estimate that can be pessimistic; let the model decide at runtime.
+    return false;
+  }
+  return !prepared.inputLength || prepared.inputLength > aiSession.profile.maxInputTokens;
 }
 
 function finalizeNewsletterMarkdown(markdown, run) {
