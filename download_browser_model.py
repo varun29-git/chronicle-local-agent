@@ -10,8 +10,6 @@ DEFAULT_REPO_ID = "onnx-community/gemma-3n-E2B-it-ONNX"
 CORE_ROOT_FILES = (
     "config.json",
     "generation_config.json",
-    "preprocessor_config.json",
-    "processor_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
@@ -78,6 +76,11 @@ def main():
         choices=[item[0] for item in PRECISION_CANDIDATES],
         help="Preferred ONNX precision. Defaults to the lightest supported pair available in the repo.",
     )
+    parser.add_argument(
+        "--include-multimodal",
+        action="store_true",
+        help="Include audio/vision encoder files. Default is text-only bundle.",
+    )
     args = parser.parse_args()
 
     destination = Path(args.destination).expanduser()
@@ -85,7 +88,11 @@ def main():
 
     api = HfApi()
     repo_files = api.list_repo_files(args.repo_id, repo_type="model")
-    selected_precision, allow_patterns = build_allow_patterns(repo_files, args.precision)
+    selected_precision, allow_patterns = build_allow_patterns(
+        repo_files,
+        args.precision,
+        include_multimodal=args.include_multimodal,
+    )
 
     print(f"Downloading {args.repo_id}")
     print(f"Destination: {destination}")
@@ -104,7 +111,7 @@ def main():
     print("Browser model download complete.")
 
 
-def build_allow_patterns(repo_files, requested_precision):
+def build_allow_patterns(repo_files, requested_precision, include_multimodal=False):
     repo_file_set = set(repo_files)
     allow_patterns = [file_name for file_name in CORE_ROOT_FILES if file_name in repo_file_set]
 
@@ -136,9 +143,10 @@ def build_allow_patterns(repo_files, requested_precision):
     if not selected_precision:
         raise SystemExit("No supported ONNX precision set was found in the repo.")
 
-    for component_name, precision_order in AUXILIARY_COMPONENTS.items():
-        auxiliary_files = collect_component_files(repo_files, component_name, precision_order)
-        allow_patterns.extend(auxiliary_files)
+    if include_multimodal:
+        for component_name, precision_order in AUXILIARY_COMPONENTS.items():
+            auxiliary_files = collect_component_files(repo_files, component_name, precision_order)
+            allow_patterns.extend(auxiliary_files)
 
     return selected_precision, sorted(dict.fromkeys(allow_patterns))
 
