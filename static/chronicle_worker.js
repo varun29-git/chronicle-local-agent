@@ -75,6 +75,12 @@ async function initializeWorkerModel(options) {
     model_kwargs: options.modelKwargs && typeof options.modelKwargs === "object" ? options.modelKwargs : {},
     progress_callback,
   });
+  if (typeof tokenizer?.batch_decode !== "function") {
+    throw new Error("Tokenizer decode API is unavailable for this model.");
+  }
+  if (typeof model?.generate !== "function") {
+    throw new Error("Model generate API is unavailable for this model.");
+  }
   currentModelId = modelId;
   currentInitKey = initKey;
 }
@@ -98,11 +104,10 @@ async function generateText(options) {
     throw new Error("Empty prompt.");
   }
 
-  const messages = [{ role: "user", content: promptText }];
-  const prompt = tokenizer.apply_chat_template(messages, {
-    add_generation_prompt: true,
-    tokenize: false,
-  });
+  const prompt = buildChatPrompt(promptText);
+  if (typeof tokenizer !== "function") {
+    throw new Error("Tokenizer encode API is unavailable for this model.");
+  }
   const inputs = await tokenizer(prompt, { add_special_tokens: false, return_tensor: true });
   const inputLength = resolveInputLength(inputs.input_ids);
 
@@ -124,6 +129,21 @@ async function generateText(options) {
     skip_special_tokens: true,
   });
   return Array.isArray(decoded) ? String(decoded[0] || "") : String(decoded || "");
+}
+
+function buildChatPrompt(promptText) {
+  const normalized = String(promptText || "").replace(/\r/g, "").trim();
+  const messages = [{ role: "user", content: normalized }];
+
+  if (typeof tokenizer?.apply_chat_template === "function") {
+    return tokenizer.apply_chat_template(messages, {
+      add_generation_prompt: true,
+      tokenize: false,
+    });
+  }
+
+  // Fallback for tokenizers that do not expose apply_chat_template in this runtime build.
+  return `User: ${normalized}\nAssistant:`;
 }
 
 function resolveInputLength(inputIds) {

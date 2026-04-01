@@ -4,7 +4,6 @@ const MODEL_CANDIDATES = [
   "onnx-community/gemma-3n-E2B-it-ONNX",
 ];
 const NON_GEMMA_DTYPE = "q4f16";
-const QUERY_STAGE_SLICE_COUNT = 1;
 
 const GEMMA3N_DTYPE_MAP = {
   decoder_model_merged: "q4",
@@ -49,13 +48,13 @@ const WRITER_POLICY = {
   openingMaxTokens: 120,
   sectionMaxTokens: 150,
   fallbackVariantChars: [120, 84],
-  fallbackTimeoutMs: 55000,
+  fallbackTimeoutMs: 120000,
   fallbackMaxTokens: { medium: 260, compact: 220 },
   polishOnPassOnly: true,
   polishMaxTokens: 260,
-  polishTimeoutMs: 50000,
-  openingAttemptTimeoutMs: 18000,
-  sectionAttemptTimeoutMs: 18000,
+  polishTimeoutMs: 120000,
+  openingAttemptTimeoutMs: 90000,
+  sectionAttemptTimeoutMs: 90000,
 };
 
 const state = {
@@ -242,23 +241,10 @@ async function runBrowserPipeline(payload) {
   state.activeStageKey = "query";
   updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
   setStageState("query", "active", getWarmupProgressLabel());
-  const sessionPromise = ensureBrowserSession().catch((error) => {
-    console.warn("[Chronicle] Background session warmup failed.", error);
-    return createNoModelSession();
-  });
-  let aiSession = await getBestEffortSession(sessionPromise, 12000);
-  if (aiSession.runtimeKind === "worker") {
-    await setSessionSlices(aiSession, QUERY_STAGE_SLICE_COUNT);
-  } else {
-    appendSystemMessage("Model is still warming. Chronicle will start now and use deterministic output until model becomes ready.");
-  }
+  const aiSession = await waitForBrowserSessionReady();
 
   updateTurnStatus("Generating search queries");
   run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
-  aiSession = await promoteSessionIfReady(aiSession, sessionPromise, 6000);
-  if (aiSession.runtimeKind === "worker") {
-    await setSessionSlices(aiSession, aiSession.profile?.sliceCount || QUERY_STAGE_SLICE_COUNT);
-  }
   setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
 
   state.activeStageKey = "search";
@@ -273,7 +259,6 @@ async function runBrowserPipeline(payload) {
   setStageState("search", "complete", `${run.rawResults.length} results collected`);
 
   state.activeStageKey = "summarize";
-  aiSession = await promoteSessionIfReady(aiSession, sessionPromise, 6000);
   const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
   run.summarizeStartedAt = performance.now();
   setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
@@ -287,8 +272,25 @@ async function runBrowserPipeline(payload) {
     setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
     updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
   }
+  let modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
+  if (modelSummaryCount === 0 && aiSession.runtimeKind === "worker") {
+    updateTurnStatus("Summary pass was slow. Retrying once with longer generation timeouts.");
+    setStageState("summarize", "active", `Retry 0/${prioritizedRawResults.length} summarized`);
+    const retrySummaries = [];
+    const retryStartedAt = performance.now();
+    for (let index = 0; index < prioritizedRawResults.length; index += 1) {
+      const result = prioritizedRawResults[index];
+      const summary = await summarizeSearchResult(aiSession, result, { longTimeout: true });
+      retrySummaries.push(summary);
+      const progressText = `Retry ${index + 1}/${prioritizedRawResults.length} summarized`;
+      const etaText = estimateLoopEta(retryStartedAt, index + 1, prioritizedRawResults.length);
+      setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
+      updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
+    }
+    run.resultSummaries = retrySummaries;
+    modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
+  }
   setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
-  const modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
   if (modelSummaryCount === 0) {
     const failureReasons = uniqueStrings(
       run.resultSummaries
@@ -296,20 +298,14 @@ async function runBrowserPipeline(payload) {
         .filter(Boolean)
     );
     const reasonText = failureReasons.length ? ` Reasons: ${failureReasons.join(", ")}` : "";
-    appendSystemMessage(
-      `Model produced 0/${run.resultSummaries.length} direct summaries. Chronicle is using deterministic fallback summaries.${reasonText}`
+    console.warn(
+      `[Chronicle] Model produced 0/${run.resultSummaries.length} direct summaries.${reasonText}`
     );
-  }
-  const requiredModelSummaries = Math.max(2, Math.ceil(run.resultSummaries.length * 0.45));
-  if (modelSummaryCount < requiredModelSummaries) {
-    appendSystemMessage(
-      `Model produced ${modelSummaryCount}/${run.resultSummaries.length} direct summaries this run. Chronicle will continue using fallback summaries for the rest.`
-    );
+    appendSystemMessage("Chronicle could not get direct model summaries on this pass, so it used safe deterministic summaries to complete the issue.");
   }
   run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
 
   state.activeStageKey = "newsletter";
-  aiSession = await promoteSessionIfReady(aiSession, sessionPromise, 4000);
   setStageState("newsletter", "active", "Writing issue");
   updateTurnStatus("Generating newsletter");
   run.newsletterStartedAt = performance.now();
@@ -363,7 +359,7 @@ async function generateSearchPlan(aiSession, payload, queryCount) {
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
         maxNewTokens: 72,
-        timeoutMs: 45000,
+        timeoutMs: 120000,
       });
       lastText = generatedText;
       const plan = parseSearchPlanText(generatedText, queryCount, payload.brief);
@@ -455,7 +451,7 @@ async function fetchGoogleResults(query, limit) {
     .filter((item) => item.title && item.url);
 }
 
-async function summarizeSearchResult(aiSession, rawResult) {
+async function summarizeSearchResult(aiSession, rawResult, options = {}) {
   const promptVariants = [
     [
       "Summarize one raw Google result without inventing facts.",
@@ -478,6 +474,7 @@ async function summarizeSearchResult(aiSession, rawResult) {
 
   let lastText = "";
   let lastErrorMessage = "";
+  const timeoutMs = options.longTimeout ? 180000 : 120000;
   for (const promptText of promptVariants) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
@@ -487,7 +484,7 @@ async function summarizeSearchResult(aiSession, rawResult) {
       }
       const generatedText = await generateFromPreparedInputs(aiSession, prepared, {
         maxNewTokens: 90,
-        timeoutMs: 45000,
+        timeoutMs,
       });
       lastText = generatedText;
       const summary = parseResultSummaryText(generatedText, rawResult);
@@ -1653,7 +1650,7 @@ async function validateModelSession(aiSession) {
       const prepared = await preparePromptInputs(aiSession, promptText);
       const reply = await generateFromPreparedInputs(aiSession, prepared, {
         maxNewTokens: 24,
-        timeoutMs: 60000,
+        timeoutMs: 180000,
       });
       lastReply = cleanText(reply);
       if (lastReply.length >= 2) {
@@ -1703,9 +1700,9 @@ function getCandidateLoadTimeoutMs(candidate) {
     return 180000;
   }
   if (candidate?.device === "webgpu") {
-    return 150000;
+    return 300000;
   }
-  return 120000;
+  return 360000;
 }
 
 async function loadTextOnlyBrowserSession(candidate, progressCallback) {
@@ -1794,44 +1791,6 @@ function sendWorkerRequest(type, payload, timeoutMs = 90000) {
   });
 }
 
-async function setSessionSlices(aiSession, targetSlices) {
-  if (!aiSession?.profile?.hasSlices || aiSession.runtimeKind !== "worker") {
-    return;
-  }
-
-  const maxSlices = aiSession.profile.maxSlices || state.browserProfile?.maxSlices || 36;
-  const requestedSlices = Math.max(1, Math.min(Number(targetSlices || 1), maxSlices));
-  if (requestedSlices === aiSession.activeSliceCount) {
-    return;
-  }
-
-  const baseModelKwargs = aiSession.profile.textModelOptions?.model_kwargs || {};
-  const modelKwargs = {
-    ...baseModelKwargs,
-    num_slices: requestedSlices,
-  };
-
-  state.browserRuntimeStatus = "warming";
-  state.browserRuntimeMessage = `Adjusting Gemma slices · ${requestedSlices}/${maxSlices}`;
-  state.browserRuntimeProgressText = "Applying slice profile…";
-  renderHeaderStatus();
-
-  await sendWorkerRequest("init", {
-    model: aiSession.profile.model,
-    device: aiSession.profile.device,
-    dtype: aiSession.profile.textModelOptions?.dtype || GEMMA3N_TEXT_DTYPE_MAP,
-    modelKwargs,
-    localModelPath: "/models",
-    numThreads: Math.min(4, navigator.hardwareConcurrency || 2),
-  }, 180000);
-
-  aiSession.activeSliceCount = requestedSlices;
-  state.browserRuntimeStatus = "ready";
-  state.browserRuntimeMessage = `Text-only local model · ${aiSession.profile.label} · num_slices=${requestedSlices} · ${runtimeLabelForSession(aiSession)} · self-test passed`;
-  state.browserRuntimeProgressText = "Warmup complete. Chronicle is ready.";
-  renderHeaderStatus();
-}
-
 async function assertLocalModelBundleReady(modelId) {
   const configPath = `/models/${modelId}/config.json`;
   const tokenizerConfigPath = `/models/${modelId}/tokenizer_config.json`;
@@ -1914,28 +1873,29 @@ function calculateBrowserProfile(config) {
 
   if (config.hasWebGPU) {
     if (config.isMobile) {
-      sliceCount = effectiveGiB >= 8 ? 12 : effectiveGiB >= 5 ? 8 : 6;
+      sliceCount = effectiveGiB >= 8 ? 12 : effectiveGiB >= 6 ? 10 : effectiveGiB >= 4 ? 8 : 6;
     } else if (effectiveGiB >= 24 && config.hardwareConcurrency >= 12) {
-      sliceCount = 36;
-    } else if (effectiveGiB >= 18 && config.hardwareConcurrency >= 10) {
-      sliceCount = 28;
-    } else if (effectiveGiB >= 12 && config.hardwareConcurrency >= 8) {
-      sliceCount = 22;
-    } else if (effectiveGiB >= 8) {
+      sliceCount = 20;
+    } else if (effectiveGiB >= 16 && config.hardwareConcurrency >= 8) {
       sliceCount = 16;
-    } else if (effectiveGiB >= 6) {
+    } else if (effectiveGiB >= 12 && config.hardwareConcurrency >= 8) {
+      sliceCount = 14;
+    } else if (effectiveGiB >= 8) {
       sliceCount = 12;
+    } else if (effectiveGiB >= 6) {
+      sliceCount = 10;
     } else if (effectiveGiB >= 4) {
       sliceCount = 8;
     } else {
       sliceCount = 6;
     }
   } else {
-    sliceCount = effectiveGiB >= 8 ? 8 : effectiveGiB >= 5 ? 6 : 4;
+    sliceCount = effectiveGiB >= 8 ? 8 : effectiveGiB >= 6 ? 7 : effectiveGiB >= 4 ? 6 : 4;
   }
 
   sliceCount = Math.max(1, Math.min(sliceCount, maxSlices));
   const percentage = Math.round((sliceCount / maxSlices) * 100);
+  const sliceRatio = sliceCount / maxSlices;
 
   return {
     maxSlices,
@@ -1944,8 +1904,8 @@ function calculateBrowserProfile(config) {
     label: `${percentage}% slice (${sliceCount}/${maxSlices})`,
     availableMemoryGiB: availableGiB,
     reservedMemoryGiB: availableGiB > 0 ? Math.max(0, availableGiB - effectiveGiB) : 0,
-    maxInputTokens: percentage >= 50 ? 1500 : percentage >= 25 ? 1240 : 980,
-    maxNewTokens: percentage >= 50 ? 900 : percentage >= 25 ? 760 : 620,
+    maxInputTokens: sliceRatio >= 0.4 ? 1480 : sliceRatio >= 0.25 ? 1320 : 1160,
+    maxNewTokens: sliceRatio >= 0.4 ? 880 : sliceRatio >= 0.25 ? 760 : 660,
     generationTimeoutMs: config.hasWebGPU ? 240000 : 300000,
   };
 }
@@ -1962,7 +1922,8 @@ function buildBrowserCandidates() {
           candidates.push(buildBrowserCandidate(modelId, "webgpu", sliceCount, baseProfile));
         });
       }
-      buildSliceFallbackChain(Math.min(baseProfile.sliceCount, 2), baseProfile.maxSlices).forEach((sliceCount) => {
+      const wasmTargetSlices = Math.max(2, Math.min(baseProfile.sliceCount, 8));
+      buildSliceFallbackChain(wasmTargetSlices, baseProfile.maxSlices).forEach((sliceCount) => {
         candidates.push(buildBrowserCandidate(modelId, "wasm", sliceCount, baseProfile));
       });
       return;
@@ -2003,21 +1964,9 @@ function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
     hasSlices,
     maxSlices: baseProfile.maxSlices,
     sliceCount,
-    maxInputTokens: hasSlices
-      ? (device === "webgpu"
-        ? Math.max(900, baseProfile.maxInputTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 120)
-        : Math.min(900, baseProfile.maxInputTokens))
-      : 560,
-    maxNewTokens: hasSlices
-      ? (device === "webgpu"
-        ? Math.max(560, baseProfile.maxNewTokens - Math.max(baseProfile.sliceCount - sliceCount, 0) * 40)
-        : Math.min(620, baseProfile.maxNewTokens))
-      : 120,
-    generationTimeoutMs: hasSlices
-      ? (device === "webgpu"
-        ? Math.max(120000, baseProfile.generationTimeoutMs - Math.max(baseProfile.sliceCount - sliceCount, 0) * 15000)
-        : Math.max(180000, baseProfile.generationTimeoutMs))
-      : 70000,
+    maxInputTokens: hasSlices ? baseProfile.maxInputTokens : 560,
+    maxNewTokens: hasSlices ? baseProfile.maxNewTokens : 120,
+    generationTimeoutMs: hasSlices ? baseProfile.generationTimeoutMs : 70000,
     textModelOptions,
     multimodalModelOptions,
   };
@@ -2048,9 +1997,9 @@ function dedupeCandidates(candidates) {
 
 function getBrowserWarmupTimeoutMs() {
   if (state.browserSession?.worker) {
-    return 15000;
+    return 30000;
   }
-  return state.browserCapabilities?.hasWebGPU ? 120000 : 150000;
+  return state.browserCapabilities?.hasWebGPU ? 480000 : 600000;
 }
 
 async function waitForBrowserSessionReady() {
@@ -2069,6 +2018,16 @@ async function waitForBrowserSessionReady() {
 
     if (Date.now() >= deadline) {
       throw new Error("The model is taking too long to load on this device. Keep the tab open a little longer, then retry.");
+    }
+
+    const stalledForMs = Date.now() - (state.browserLastProgressAt || 0);
+    if (
+      state.browserRuntimeStatus === "warming"
+      && state.browserRuntimeProgress >= 0.96
+      && stalledForMs > 7000
+    ) {
+      state.browserRuntimeProgressText = "Files loaded. Compiling model in browser memory (this can take 1-2 minutes).";
+      renderHeaderStatus();
     }
 
     const now = Date.now();
@@ -2237,10 +2196,12 @@ async function preparePromptInputs(aiSession, promptText) {
         content: [{ type: "text", text: promptText }],
       },
     ];
-  const prompt = aiSession.codec.apply_chat_template(messages, {
-    add_generation_prompt: true,
-    tokenize: false,
-  });
+  const prompt = typeof aiSession.codec?.apply_chat_template === "function"
+    ? aiSession.codec.apply_chat_template(messages, {
+      add_generation_prompt: true,
+      tokenize: false,
+    })
+    : `User: ${String(promptText || "").trim()}\nAssistant:`;
   const inputs = aiSession.runtimeKind === "text"
     ? await aiSession.tokenizer(prompt, { add_special_tokens: false, return_tensor: true })
     : await aiSession.processor(prompt, null, null, { add_special_tokens: false });
@@ -2258,20 +2219,55 @@ async function generateFromPreparedInputs(aiSession, prepared, options) {
   }
 
   if (aiSession.runtimeKind === "worker") {
-    await yieldToBrowser();
-    const result = await sendWorkerRequest(
+    const baseMaxNewTokens = options.maxNewTokens || aiSession.profile.maxNewTokens;
+    const baseTimeoutMs = options.timeoutMs || aiSession.profile.generationTimeoutMs;
+    const requestGeneration = async (requestOptions, timeoutMs) => sendWorkerRequest(
       "generate",
       {
         prompt: prepared.prompt,
-        maxNewTokens: options.maxNewTokens || aiSession.profile.maxNewTokens,
-        timeoutMs: options.timeoutMs || aiSession.profile.generationTimeoutMs,
-        doSample: Boolean(options.doSample),
-        temperature: options.doSample ? options.temperature || 0.7 : undefined,
-        topP: options.doSample ? options.topP || 0.92 : undefined,
-        repetitionPenalty: options.repetitionPenalty || 1.08,
+        maxNewTokens: requestOptions.maxNewTokens,
+        timeoutMs,
+        doSample: Boolean(requestOptions.doSample),
+        temperature: requestOptions.doSample ? requestOptions.temperature : undefined,
+        topP: requestOptions.doSample ? requestOptions.topP : undefined,
+        repetitionPenalty: requestOptions.repetitionPenalty,
       },
-      options.timeoutMs || aiSession.profile.generationTimeoutMs,
+      timeoutMs,
     );
+
+    await yieldToBrowser();
+    let result;
+    try {
+      result = await requestGeneration(
+        {
+          maxNewTokens: baseMaxNewTokens,
+          doSample: Boolean(options.doSample),
+          temperature: options.doSample ? options.temperature || 0.7 : undefined,
+          topP: options.doSample ? options.topP || 0.92 : undefined,
+          repetitionPenalty: options.repetitionPenalty || 1.08,
+        },
+        baseTimeoutMs,
+      );
+    } catch (error) {
+      const message = cleanText(error?.message || "").toLowerCase();
+      const retriable = message.includes("timed out") || message.includes("empty response");
+      if (!retriable) {
+        throw error;
+      }
+      console.warn("[Chronicle] Retrying slow worker generation with conservative settings.");
+      await yieldToBrowser();
+      result = await requestGeneration(
+        {
+          maxNewTokens: Math.max(48, Math.round(baseMaxNewTokens * 0.7)),
+          doSample: true,
+          temperature: 0.68,
+          topP: 0.9,
+          repetitionPenalty: 1.08,
+        },
+        Math.max(baseTimeoutMs, 150000),
+      );
+    }
+
     const generatedText = cleanText(result.text || "");
     if (!generatedText) {
       throw new Error("The browser model returned an empty response.");
@@ -2306,25 +2302,6 @@ async function generateFromPreparedInputs(aiSession, prepared, options) {
 
   await yieldToBrowser();
   return generatedText;
-}
-
-function createNoModelSession() {
-  return {
-    runtimeKind: "none",
-    profile: {
-      hasSlices: false,
-      sliceCount: 1,
-      maxSlices: 36,
-      maxInputTokens: 0,
-      maxNewTokens: 0,
-      generationTimeoutMs: 0,
-      label: "Fallback mode",
-      device: "wasm",
-      model: "",
-      textModelOptions: {},
-    },
-    activeSliceCount: 1,
-  };
 }
 
 function buildSyntheticRawResults(queryPlan, payload, count) {
