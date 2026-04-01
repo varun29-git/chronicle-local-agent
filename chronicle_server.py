@@ -137,7 +137,7 @@ class ChronicleStaticHandler(BaseHTTPRequestHandler):
         )
 
         try:
-            with urlopen(request, timeout=25, context=build_ssl_context()) as response:
+            with urlopen(request, timeout=8, context=build_ssl_context()) as response:
                 content = response.read()
                 content_type = response.headers.get_content_type() or "application/rss+xml"
         except Exception as exc:  # noqa: BLE001

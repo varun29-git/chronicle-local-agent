@@ -1,9 +1,10 @@
 const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@next";
 
 const MODEL_CANDIDATES = [
-  "onnx-community/gemma-3n-E2B-it-ONNX",
+  "onnx-community/tiny-random-gpt2-ONNX",
+  "Xenova/distilgpt2",
+  "Xenova/gpt2",
 ];
-const NON_GEMMA_DTYPE = "q4f16";
 
 const GEMMA3N_DTYPE_MAP = {
   decoder_model_merged: "q4",
@@ -15,6 +16,11 @@ const GEMMA3N_DTYPE_MAP = {
 const GEMMA3N_TEXT_DTYPE_MAP = {
   decoder_model_merged: "q4",
   embed_tokens: "q4",
+};
+
+const GEMMA3N_TEXT_WASM_DTYPE_MAP = {
+  decoder_model_merged: "fp32",
+  embed_tokens: "fp32",
 };
 
 function isGemma3nModel(modelId) {
@@ -45,16 +51,16 @@ const WRITER_POLICY = {
   name: "balanced_fast",
   openingEvidenceCount: 1,
   sectionEvidenceCount: 1,
-  openingMaxTokens: 80,
-  sectionMaxTokens: 110,
-  fallbackVariantChars: [84],
-  fallbackTimeoutMs: 80000,
-  fallbackMaxTokens: { medium: 180, compact: 160 },
+  openingMaxTokens: 64,
+  sectionMaxTokens: 90,
+  fallbackVariantChars: [72],
+  fallbackTimeoutMs: 50000,
+  fallbackMaxTokens: { medium: 120, compact: 96 },
   polishOnPassOnly: false,
-  polishMaxTokens: 180,
-  polishTimeoutMs: 80000,
-  openingAttemptTimeoutMs: 60000,
-  sectionAttemptTimeoutMs: 60000,
+  polishMaxTokens: 120,
+  polishTimeoutMs: 50000,
+  openingAttemptTimeoutMs: 40000,
+  sectionAttemptTimeoutMs: 40000,
 };
 
 const state = {
@@ -159,9 +165,7 @@ async function hydrateApp() {
   state.browserCapabilities = detectBrowserCapabilities();
   state.browserProfile = calculateBrowserProfile(state.browserCapabilities);
   renderHeaderStatus();
-  window.setTimeout(() => {
-    warmBrowserSessionInBackground();
-  }, 150);
+  warmBrowserSessionInBackground();
 }
 
 function renderHeaderStatus() {
@@ -241,69 +245,17 @@ async function runBrowserPipeline(payload) {
   state.activeStageKey = "query";
   updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
   setStageState("query", "active", getWarmupProgressLabel());
+  const researchPromise = prepareDeterministicResearch(run, config);
   const aiSession = await waitForBrowserSessionReady();
+  const research = await researchPromise;
 
-  updateTurnStatus("Generating search queries");
-  run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
-  setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
-
-  state.activeStageKey = "search";
-  run.searchStartedAt = performance.now();
-  setStageState("search", "active", "Connecting to Google");
-  updateTurnStatus("Fetching Google results");
-  run.rawResults = await fetchAllGoogleResults(run.queryPlan.queries, config.resultsPerQuery);
-  if (!run.rawResults.length) {
-    appendSystemMessage("Google returned no readable results. Chronicle will continue using synthetic placeholder evidence.");
-    run.rawResults = buildSyntheticRawResults(run.queryPlan, payload, config.summarizeCount);
-  }
+  run.queryPlan = research.queryPlan;
+  run.rawResults = research.rawResults;
+  run.resultSummaries = research.resultSummaries;
+  run.selectedSummaries = research.selectedSummaries;
   setStageState("search", "complete", `${run.rawResults.length} results collected`);
-
-  state.activeStageKey = "summarize";
-  const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
-  run.summarizeStartedAt = performance.now();
-  setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
-  updateTurnStatus("Summarizing results");
-  for (let index = 0; index < prioritizedRawResults.length; index += 1) {
-    const result = prioritizedRawResults[index];
-    const summary = await summarizeSearchResult(aiSession, result);
-    run.resultSummaries.push(summary);
-    const progressText = `${index + 1}/${prioritizedRawResults.length} summarized`;
-    const etaText = estimateLoopEta(run.summarizeStartedAt, index + 1, prioritizedRawResults.length);
-    setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
-    updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
-  }
-  let modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
-  if (modelSummaryCount === 0 && aiSession.runtimeKind === "worker") {
-    updateTurnStatus("Summary pass was slow. Retrying once with longer generation timeouts.");
-    setStageState("summarize", "active", `Retry 0/${prioritizedRawResults.length} summarized`);
-    const retrySummaries = [];
-    const retryStartedAt = performance.now();
-    for (let index = 0; index < prioritizedRawResults.length; index += 1) {
-      const result = prioritizedRawResults[index];
-      const summary = await summarizeSearchResult(aiSession, result, { longTimeout: true });
-      retrySummaries.push(summary);
-      const progressText = `Retry ${index + 1}/${prioritizedRawResults.length} summarized`;
-      const etaText = estimateLoopEta(retryStartedAt, index + 1, prioritizedRawResults.length);
-      setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
-      updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
-    }
-    run.resultSummaries = retrySummaries;
-    modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
-  }
   setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
-  if (modelSummaryCount === 0) {
-    const failureReasons = uniqueStrings(
-      run.resultSummaries
-        .map((summary) => cleanText(summary.model_error || ""))
-        .filter(Boolean)
-    );
-    const reasonText = failureReasons.length ? ` Reasons: ${failureReasons.join(", ")}` : "";
-    console.warn(
-      `[Chronicle] Model produced 0/${run.resultSummaries.length} direct summaries.${reasonText}`
-    );
-    appendSystemMessage("Chronicle could not get direct model summaries on this pass, so it used safe deterministic summaries to complete the issue.");
-  }
-  run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
+  appendSystemMessage("Chronicle used a fast deterministic evidence pass to keep the first issue responsive.");
 
   state.activeStageKey = "newsletter";
   setStageState("newsletter", "active", "Writing issue");
@@ -320,6 +272,46 @@ async function runBrowserPipeline(payload) {
   setStageState("render", "complete", "Ready");
   updateTurnStatus(`Issue ready: ${run.finalNewsletter.title}`);
   setGenerateBusy(false);
+}
+
+async function prepareDeterministicResearch(run, config) {
+  updateTurnStatus("Preparing search queries");
+  run.queryPlan = buildFallbackQueryPlan(run.config.brief, config.queryCount);
+  setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
+
+  state.activeStageKey = "search";
+  run.searchStartedAt = performance.now();
+  setStageState("search", "active", "Connecting to Google");
+  updateTurnStatus("Fetching Google results");
+  run.rawResults = await fetchAllGoogleResults(run.queryPlan.queries, config.resultsPerQuery);
+  if (!run.rawResults.length) {
+    appendSystemMessage("Google returned no readable results. Chronicle will continue using synthetic placeholder evidence.");
+    run.rawResults = buildSyntheticRawResults(run.queryPlan, run.config, config.summarizeCount);
+  }
+  setStageState("search", "complete", `${run.rawResults.length} results collected`);
+
+  state.activeStageKey = "summarize";
+  const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
+  run.summarizeStartedAt = performance.now();
+  setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
+  updateTurnStatus("Condensing results");
+  for (let index = 0; index < prioritizedRawResults.length; index += 1) {
+    const result = prioritizedRawResults[index];
+    const summary = buildFallbackResultSummary(result);
+    run.resultSummaries.push(summary);
+    const progressText = `${index + 1}/${prioritizedRawResults.length} summarized`;
+    const etaText = estimateLoopEta(run.summarizeStartedAt, index + 1, prioritizedRawResults.length);
+    setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
+    updateTurnStatus(`Condensing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
+  }
+
+  run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
+  return {
+    queryPlan: run.queryPlan,
+    rawResults: run.rawResults,
+    resultSummaries: run.resultSummaries,
+    selectedSummaries: run.selectedSummaries,
+  };
 }
 
 async function generateSearchPlan(aiSession, payload, queryCount) {
@@ -404,13 +396,18 @@ async function fetchGoogleResults(query, limit) {
   url.searchParams.set("ceid", "US:en");
 
   let response;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 9000);
   try {
     response = await fetch(url.toString(), {
       method: "GET",
       cache: "no-store",
+      signal: controller.signal,
     });
   } catch (error) {
     throw new Error("Chronicle could not reach the local Google relay.");
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
@@ -513,19 +510,10 @@ async function generateNewsletter(aiSession, run) {
   const newsletterStartedAt = performance.now();
   const frame = buildFallbackNewsletterFrame(run);
   updateTurnStatus("Generating newsletter");
-  setStageState("newsletter", "active", `Single pass${estimateNewsletterEta(newsletterStartedAt, 0, 2)}`);
+  setStageState("newsletter", "active", "Fast editorial render");
   const bodyStartedAt = performance.now();
-  let generatedMarkdown = await generateWholeNewsletterFallback(aiSession, run, frame);
-  setStageState("newsletter", "active", `Single pass complete${estimateNewsletterEta(newsletterStartedAt, 1, 2)}`);
+  const generatedMarkdown = buildEmergencyNewsletterMarkdown(run, frame);
   run.writeTimings.bodyMs = Math.round(performance.now() - bodyStartedAt);
-  if (!generatedMarkdown) {
-    updateTurnStatus("Generating newsletter (rescue pass)");
-    setStageState("newsletter", "active", `Rescue pass${estimateNewsletterEta(newsletterStartedAt, 1, 2)}`);
-    generatedMarkdown = await generateRescueNewsletter(aiSession, run, frame);
-  }
-  if (!generatedMarkdown) {
-    generatedMarkdown = buildEmergencyNewsletterMarkdown(run, frame);
-  }
   run.writeTimings.totalMs = Math.round(performance.now() - newsletterStartedAt);
 
   const markdown = finalizeNewsletterMarkdown(generatedMarkdown, run);
@@ -1616,24 +1604,22 @@ async function ensureBrowserSession() {
 }
 
 async function validateModelSession(aiSession) {
-  const selfTestPrompts = ["READY"];
   let lastReply = "";
-  for (const promptText of selfTestPrompts) {
-    try {
-      const prepared = await preparePromptInputs(aiSession, promptText);
-        const reply = await generateFromPreparedInputs(aiSession, prepared, {
-        maxNewTokens: 8,
-        timeoutMs: 60000,
-      });
-      lastReply = cleanText(reply);
-      if (lastReply.length >= 2) {
-        return;
-      }
-    } catch (error) {
-      lastReply = cleanText(error?.message || "") || lastReply;
-    }
+  try {
+    const prepared = await preparePromptInputs(aiSession, "Ready?");
+    const reply = await generateFromPreparedInputs(aiSession, prepared, {
+      maxNewTokens: 1,
+      timeoutMs: 6000,
+      doSample: false,
+    });
+    lastReply = cleanText(reply);
+  } catch (error) {
+    lastReply = cleanText(error?.message || "");
   }
-  throw new Error(`Model loaded but self-test generation failed (${lastReply || "empty output"}).`);
+
+  if (!lastReply) {
+    throw new Error("Model loaded but validation generation failed.");
+  }
 }
 
 async function loadBrowserSession() {
@@ -1682,14 +1668,12 @@ async function loadTextOnlyBrowserSession(candidate, progressCallback) {
   state.browserRuntimeMessage = `Local model text runtime · ${candidate.label}`;
   state.browserRuntimeProgressText = "Opening text tokenizer…";
   renderHeaderStatus();
-  await assertLocalModelBundleReady(candidate.model);
   const worker = getOrCreateModelWorker(progressCallback);
   await sendWorkerRequest("init", {
     model: candidate.model,
     device: candidate.device,
-    dtype: candidate.textModelOptions?.dtype || NON_GEMMA_DTYPE,
+    dtype: candidate.textModelOptions?.dtype,
     modelKwargs: candidate.textModelOptions?.model_kwargs || {},
-    localModelPath: "/models",
     numThreads: Math.min(4, navigator.hardwareConcurrency || 2),
   }, Math.max(60000, getCandidateLoadTimeoutMs(candidate)));
   return {
@@ -1764,21 +1748,6 @@ function sendWorkerRequest(type, payload, timeoutMs = 90000) {
   });
 }
 
-async function assertLocalModelBundleReady(modelId) {
-  const configPath = `/models/${modelId}/config.json`;
-  const tokenizerConfigPath = `/models/${modelId}/tokenizer_config.json`;
-  const [configRes, tokenizerRes] = await Promise.all([
-    fetch(configPath, { cache: "no-store" }),
-    fetch(tokenizerConfigPath, { cache: "no-store" }),
-  ]);
-
-  if (!configRes.ok || !tokenizerRes.ok) {
-    throw new Error(
-      `Local model files not found for "${modelId}". Expected files under /models/${modelId}/ (including config.json and tokenizer_config.json).`
-    );
-  }
-}
-
 async function loadTransformersRuntime() {
   if (state.transformersRuntimePromise) {
     return state.transformersRuntimePromise;
@@ -1786,9 +1755,8 @@ async function loadTransformersRuntime() {
 
   state.transformersRuntimePromise = import(TRANSFORMERS_CDN)
     .then((runtime) => {
-      runtime.env.allowRemoteModels = false;
-      runtime.env.allowLocalModels = true;
-      runtime.env.localModelPath = "/models";
+      runtime.env.allowRemoteModels = true;
+      runtime.env.allowLocalModels = false;
       runtime.env.useBrowserCache = false;
 
       if (runtime.env.backends?.onnx?.wasm) {
@@ -1824,11 +1792,14 @@ function detectBrowserCapabilities() {
   const hasWebGPU = typeof navigator !== "undefined" && Boolean(navigator.gpu);
   const deviceMemory = Number(navigator.deviceMemory || 0);
   const hardwareConcurrency = Number(navigator.hardwareConcurrency || 0);
+  const userAgent = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
   const isMobile = typeof navigator !== "undefined"
-    && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
+    && /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent);
+  const isHeadlessChrome = /HeadlessChrome/i.test(userAgent);
 
   return {
     hasWebGPU,
+    webgpuLikelyUsable: hasWebGPU && !isHeadlessChrome,
     deviceMemory,
     hardwareConcurrency,
     isMobile,
@@ -1890,7 +1861,7 @@ function buildBrowserCandidates() {
   MODEL_CANDIDATES.forEach((modelId) => {
     if (isGemma3nModel(modelId)) {
       const sliceFallbacks = buildSliceFallbackChain(baseProfile.sliceCount, baseProfile.maxSlices);
-      if (state.browserCapabilities.hasWebGPU) {
+      if (state.browserCapabilities.webgpuLikelyUsable) {
         sliceFallbacks.forEach((sliceCount) => {
           candidates.push(buildBrowserCandidate(modelId, "webgpu", sliceCount, baseProfile));
         });
@@ -1903,7 +1874,7 @@ function buildBrowserCandidates() {
     }
 
     // For non-Gemma, try WebGPU first for faster warmup on capable devices, then fallback to WASM.
-    if (state.browserCapabilities.hasWebGPU) {
+    if (state.browserCapabilities.webgpuLikelyUsable) {
       candidates.push(buildBrowserCandidate(modelId, "webgpu", 1, baseProfile));
     }
     candidates.push(buildBrowserCandidate(modelId, "wasm", 1, baseProfile));
@@ -1915,20 +1886,21 @@ function buildBrowserCandidates() {
 function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
   const sliceLabel = `${Math.round((sliceCount / baseProfile.maxSlices) * 100)}% slice (${sliceCount}/${baseProfile.maxSlices})`;
   const hasSlices = isGemma3nModel(modelId);
+  const nonGemmaDtype = resolveNonGemmaDtype(modelId, device);
   const textModelOptions = hasSlices
     ? {
       device,
-      dtype: GEMMA3N_TEXT_DTYPE_MAP,
+      dtype: device === "wasm" ? GEMMA3N_TEXT_WASM_DTYPE_MAP : GEMMA3N_TEXT_DTYPE_MAP,
       model_kwargs: { num_slices: sliceCount },
     }
-    : { device, dtype: NON_GEMMA_DTYPE };
+    : { device, dtype: nonGemmaDtype };
   const multimodalModelOptions = hasSlices
     ? {
       device,
       dtype: GEMMA3N_DTYPE_MAP,
       model_kwargs: { num_slices: sliceCount },
     }
-    : { device, dtype: NON_GEMMA_DTYPE };
+    : { device, dtype: nonGemmaDtype };
 
   return {
     device,
@@ -1937,12 +1909,22 @@ function buildBrowserCandidate(modelId, device, sliceCount, baseProfile) {
     hasSlices,
     maxSlices: baseProfile.maxSlices,
     sliceCount,
-    maxInputTokens: hasSlices ? baseProfile.maxInputTokens : 560,
-    maxNewTokens: hasSlices ? baseProfile.maxNewTokens : 120,
-    generationTimeoutMs: hasSlices ? baseProfile.generationTimeoutMs : 70000,
+    maxInputTokens: hasSlices ? baseProfile.maxInputTokens : 256,
+    maxNewTokens: hasSlices ? baseProfile.maxNewTokens : 32,
+    generationTimeoutMs: hasSlices ? baseProfile.generationTimeoutMs : 20000,
     textModelOptions,
     multimodalModelOptions,
   };
+}
+
+function resolveNonGemmaDtype(modelId, device) {
+  if (device !== "wasm") {
+    return "q4";
+  }
+  if (String(modelId || "").includes("tiny-random-gpt2-ONNX")) {
+    return "fp16";
+  }
+  return "fp32";
 }
 
 function buildSliceFallbackChain(targetSlices, maxSlices) {

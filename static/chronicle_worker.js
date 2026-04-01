@@ -32,12 +32,11 @@ self.onmessage = async (event) => {
   }
 };
 
-async function loadRuntime(localModelPath, numThreads) {
+async function loadRuntime(numThreads) {
   if (!runtimePromise) {
     runtimePromise = import(TRANSFORMERS_CDN).then((runtime) => {
-      runtime.env.allowRemoteModels = false;
-      runtime.env.allowLocalModels = true;
-      runtime.env.localModelPath = localModelPath || "/models";
+      runtime.env.allowRemoteModels = true;
+      runtime.env.allowLocalModels = false;
       runtime.env.useBrowserCache = false;
       if (runtime.env.backends?.onnx?.wasm) {
         runtime.env.backends.onnx.wasm.numThreads = Math.min(2, Number(numThreads || 2));
@@ -63,18 +62,24 @@ async function initializeWorkerModel(options) {
   currentModelId = "";
   currentInitKey = "";
 
-  const runtime = await loadRuntime(options.localModelPath, options.numThreads);
+  const runtime = await loadRuntime(options.numThreads);
   const progress_callback = (progress) => {
     self.postMessage({ type: "progress", progress });
   };
 
-  tokenizer = await runtime.AutoTokenizer.from_pretrained(modelId, { progress_callback });
-  model = await runtime.AutoModelForCausalLM.from_pretrained(modelId, {
-    device: String(options.device || "wasm"),
-    dtype: options.dtype || "q4f16",
-    model_kwargs: options.modelKwargs && typeof options.modelKwargs === "object" ? options.modelKwargs : {},
-    progress_callback,
-  });
+  const device = String(options.device || "wasm");
+  const dtype = options.dtype || "q4f16";
+  const modelKwargs = options.modelKwargs && typeof options.modelKwargs === "object" ? options.modelKwargs : {};
+
+  [tokenizer, model] = await Promise.all([
+    runtime.AutoTokenizer.from_pretrained(modelId, { progress_callback }),
+    runtime.AutoModelForCausalLM.from_pretrained(modelId, {
+      device,
+      dtype,
+      model_kwargs: modelKwargs,
+      progress_callback,
+    }),
+  ]);
   if (typeof tokenizer?.batch_decode !== "function") {
     throw new Error("Tokenizer decode API is unavailable for this model.");
   }
