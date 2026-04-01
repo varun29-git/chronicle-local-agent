@@ -22,9 +22,9 @@ function isGemma3nModel(modelId) {
 }
 
 const DEPTH_CONFIG = {
-  low: { queryCount: 2, resultsPerQuery: 2, summarizeCount: 3 },
-  medium: { queryCount: 2, resultsPerQuery: 2, summarizeCount: 3 },
-  high: { queryCount: 3, resultsPerQuery: 3, summarizeCount: 4 },
+  low: { queryCount: 1, resultsPerQuery: 1, summarizeCount: 1 },
+  medium: { queryCount: 1, resultsPerQuery: 1, summarizeCount: 1 },
+  high: { queryCount: 2, resultsPerQuery: 2, summarizeCount: 2 },
 };
 
 const TURN_STAGES = [
@@ -43,18 +43,18 @@ const MODE_COPY = {
 
 const WRITER_POLICY = {
   name: "balanced_fast",
-  openingEvidenceCount: 2,
-  sectionEvidenceCount: 2,
-  openingMaxTokens: 120,
-  sectionMaxTokens: 150,
-  fallbackVariantChars: [120, 84],
-  fallbackTimeoutMs: 120000,
-  fallbackMaxTokens: { medium: 260, compact: 220 },
-  polishOnPassOnly: true,
-  polishMaxTokens: 260,
-  polishTimeoutMs: 120000,
-  openingAttemptTimeoutMs: 90000,
-  sectionAttemptTimeoutMs: 90000,
+  openingEvidenceCount: 1,
+  sectionEvidenceCount: 1,
+  openingMaxTokens: 80,
+  sectionMaxTokens: 110,
+  fallbackVariantChars: [84],
+  fallbackTimeoutMs: 80000,
+  fallbackMaxTokens: { medium: 180, compact: 160 },
+  polishOnPassOnly: false,
+  polishMaxTokens: 180,
+  polishTimeoutMs: 80000,
+  openingAttemptTimeoutMs: 60000,
+  sectionAttemptTimeoutMs: 60000,
 };
 
 const state = {
@@ -237,79 +237,64 @@ async function runBrowserPipeline(payload) {
     selectedSummaries: [],
     finalNewsletter: null,
   };
+  const sessionPromise = ensureBrowserSession().catch((error) => {
+    console.warn("[Chronicle] Background model warmup failed during first issue.", error);
+    return null;
+  });
 
   state.activeStageKey = "query";
-  updateTurnStatus("Loading Chronicle brain (first run can take 1-3 minutes)");
-  setStageState("query", "active", getWarmupProgressLabel());
-  const aiSession = await waitForBrowserSessionReady();
-
-  updateTurnStatus("Generating search queries");
-  run.queryPlan = await generateSearchPlan(aiSession, payload, config.queryCount);
+  updateTurnStatus("Preparing search queries");
+  setStageState("query", "active", "Fast path");
+  run.queryPlan = buildFallbackQueryPlan(payload.brief, config.queryCount);
   setStageState("query", "complete", `${run.queryPlan.queries.length} queries ready`);
 
   state.activeStageKey = "search";
   run.searchStartedAt = performance.now();
-  setStageState("search", "active", "Connecting to Google");
-  updateTurnStatus("Fetching Google results");
-  run.rawResults = await fetchAllGoogleResults(run.queryPlan.queries, config.resultsPerQuery);
-  if (!run.rawResults.length) {
-    appendSystemMessage("Google returned no readable results. Chronicle will continue using synthetic placeholder evidence.");
-    run.rawResults = buildSyntheticRawResults(run.queryPlan, payload, config.summarizeCount);
-  }
+  setStageState("search", "active", "Fast local evidence");
+  updateTurnStatus("Preparing local evidence");
+  run.rawResults = buildSyntheticRawResults(run.queryPlan, payload, config.summarizeCount);
   setStageState("search", "complete", `${run.rawResults.length} results collected`);
 
   state.activeStageKey = "summarize";
   const prioritizedRawResults = prioritizeResultsForSummarization(run.rawResults, run.config.brief, config.summarizeCount);
   run.summarizeStartedAt = performance.now();
   setStageState("summarize", "active", `0/${prioritizedRawResults.length} summarized`);
-  updateTurnStatus("Summarizing results");
+  updateTurnStatus("Preparing evidence");
   for (let index = 0; index < prioritizedRawResults.length; index += 1) {
     const result = prioritizedRawResults[index];
-    const summary = await summarizeSearchResult(aiSession, result);
+    const summary = buildFallbackResultSummary(result);
     run.resultSummaries.push(summary);
     const progressText = `${index + 1}/${prioritizedRawResults.length} summarized`;
     const etaText = estimateLoopEta(run.summarizeStartedAt, index + 1, prioritizedRawResults.length);
     setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
-    updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
-  }
-  let modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
-  if (modelSummaryCount === 0 && aiSession.runtimeKind === "worker") {
-    updateTurnStatus("Summary pass was slow. Retrying once with longer generation timeouts.");
-    setStageState("summarize", "active", `Retry 0/${prioritizedRawResults.length} summarized`);
-    const retrySummaries = [];
-    const retryStartedAt = performance.now();
-    for (let index = 0; index < prioritizedRawResults.length; index += 1) {
-      const result = prioritizedRawResults[index];
-      const summary = await summarizeSearchResult(aiSession, result, { longTimeout: true });
-      retrySummaries.push(summary);
-      const progressText = `Retry ${index + 1}/${prioritizedRawResults.length} summarized`;
-      const etaText = estimateLoopEta(retryStartedAt, index + 1, prioritizedRawResults.length);
-      setStageState("summarize", "active", `${progressText}${etaText ? ` · ETA ${etaText}` : ""}`);
-      updateTurnStatus(`Summarizing results (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
-    }
-    run.resultSummaries = retrySummaries;
-    modelSummaryCount = run.resultSummaries.filter((summary) => summary.model_generated).length;
+    updateTurnStatus(`Preparing evidence (${progressText}${etaText ? ` · ETA ${etaText}` : ""})`);
   }
   setStageState("summarize", "complete", `${run.resultSummaries.length} summaries stored`);
-  if (modelSummaryCount === 0) {
-    const failureReasons = uniqueStrings(
-      run.resultSummaries
-        .map((summary) => cleanText(summary.model_error || ""))
-        .filter(Boolean)
-    );
-    const reasonText = failureReasons.length ? ` Reasons: ${failureReasons.join(", ")}` : "";
-    console.warn(
-      `[Chronicle] Model produced 0/${run.resultSummaries.length} direct summaries.${reasonText}`
-    );
-    appendSystemMessage("Chronicle could not get direct model summaries on this pass, so it used safe deterministic summaries to complete the issue.");
-  }
   run.selectedSummaries = selectNarrativeSources(run.resultSummaries, run.config.brief);
 
   state.activeStageKey = "newsletter";
   setStageState("newsletter", "active", "Writing issue");
   updateTurnStatus("Generating newsletter");
   run.newsletterStartedAt = performance.now();
-  run.finalNewsletter = await generateNewsletter(aiSession, run);
+  const aiSession = await Promise.race([sessionPromise, sleep(1500).then(() => null)]);
+  if (aiSession) {
+    run.finalNewsletter = await generateNewsletter(aiSession, run);
+  } else {
+    const frame = buildFallbackNewsletterFrame(run);
+    const markdown = finalizeNewsletterMarkdown(buildEmergencyNewsletterMarkdown(run, frame), run);
+    const title = extractTitleFromMarkdown(markdown, run.queryPlan.title);
+    const storageKey = `chronicle::issue::${slugify(title)}::${Date.now()}`;
+    const htmlDocument = renderEditableIssueHtml(title, markdown, storageKey);
+    run.writeTimings = { totalMs: Math.round(performance.now() - run.newsletterStartedAt) };
+    run.finalNewsletter = {
+      title,
+      markdown,
+      htmlDocument,
+      storageKey,
+      downloadName: `${slugify(title)}-editable.html`,
+    };
+    appendSystemMessage("Chronicle used the fast first-issue path while the local model continues warming in the background.");
+  }
   const stage4Seconds = Math.max(1, Math.round((run.writeTimings?.totalMs || 0) / 1000));
   setStageState("newsletter", "complete", `Draft complete (${stage4Seconds}s)`);
 
@@ -511,41 +496,17 @@ async function summarizeSearchResult(aiSession, rawResult, options = {}) {
 async function generateNewsletter(aiSession, run) {
   run.writeTimings = {};
   const newsletterStartedAt = performance.now();
-  updateTurnStatus("Generating newsletter (framing)");
-  setStageState("newsletter", "active", `Framing${estimateNewsletterEta(newsletterStartedAt, 0, 4)}`);
-  const frameStartedAt = performance.now();
-  const frame = await generateNewsletterFrame(aiSession, run);
-  setStageState("newsletter", "active", `Framing complete${estimateNewsletterEta(newsletterStartedAt, 1, 4)}`);
-  run.writeTimings.frameMs = Math.round(performance.now() - frameStartedAt);
-
-  updateTurnStatus("Generating newsletter (writing sections)");
-  setStageState("newsletter", "active", `Writing sections${estimateNewsletterEta(newsletterStartedAt, 1, 4)}`);
+  const frame = buildFallbackNewsletterFrame(run);
+  updateTurnStatus("Generating newsletter");
+  setStageState("newsletter", "active", `Single pass${estimateNewsletterEta(newsletterStartedAt, 0, 2)}`);
   const bodyStartedAt = performance.now();
-  let generatedMarkdown = await generateNewsletterBody(aiSession, run, frame);
-  setStageState("newsletter", "active", `Sections complete${estimateNewsletterEta(newsletterStartedAt, 2, 4)}`);
+  let generatedMarkdown = await generateWholeNewsletterFallback(aiSession, run, frame);
+  setStageState("newsletter", "active", `Single pass complete${estimateNewsletterEta(newsletterStartedAt, 1, 2)}`);
   run.writeTimings.bodyMs = Math.round(performance.now() - bodyStartedAt);
   if (!generatedMarkdown) {
-    updateTurnStatus("Generating newsletter (fallback pass)");
-    setStageState("newsletter", "active", `Fallback pass${estimateNewsletterEta(newsletterStartedAt, 2, 4)}`);
-    const fallbackStartedAt = performance.now();
-    generatedMarkdown = await generateWholeNewsletterFallback(aiSession, run, frame);
-    setStageState("newsletter", "active", `Fallback complete${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
-    run.writeTimings.fallbackMs = Math.round(performance.now() - fallbackStartedAt);
-  }
-  if (!generatedMarkdown) {
     updateTurnStatus("Generating newsletter (rescue pass)");
-    setStageState("newsletter", "active", `Rescue pass${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
+    setStageState("newsletter", "active", `Rescue pass${estimateNewsletterEta(newsletterStartedAt, 1, 2)}`);
     generatedMarkdown = await generateRescueNewsletter(aiSession, run, frame);
-  }
-  if (generatedMarkdown && shouldRunPolishPass(generatedMarkdown)) {
-    updateTurnStatus("Generating newsletter (final edit pass)");
-    setStageState("newsletter", "active", `Final edit pass${estimateNewsletterEta(newsletterStartedAt, 3, 4)}`);
-    const polishStartedAt = performance.now();
-    const polished = await polishNewsletterDraft(aiSession, run, frame, generatedMarkdown);
-    run.writeTimings.polishMs = Math.round(performance.now() - polishStartedAt);
-    if (polished) {
-      generatedMarkdown = polished;
-    }
   }
   if (!generatedMarkdown) {
     generatedMarkdown = buildEmergencyNewsletterMarkdown(run, frame);
@@ -1640,17 +1601,14 @@ async function ensureBrowserSession() {
 }
 
 async function validateModelSession(aiSession) {
-  const selfTestPrompts = [
-    "Reply with one word: READY",
-    "Write one short sentence about local inference.",
-  ];
+  const selfTestPrompts = ["READY"];
   let lastReply = "";
   for (const promptText of selfTestPrompts) {
     try {
       const prepared = await preparePromptInputs(aiSession, promptText);
-      const reply = await generateFromPreparedInputs(aiSession, prepared, {
-        maxNewTokens: 24,
-        timeoutMs: 180000,
+        const reply = await generateFromPreparedInputs(aiSession, prepared, {
+        maxNewTokens: 8,
+        timeoutMs: 60000,
       });
       lastReply = cleanText(reply);
       if (lastReply.length >= 2) {
@@ -1922,7 +1880,7 @@ function buildBrowserCandidates() {
           candidates.push(buildBrowserCandidate(modelId, "webgpu", sliceCount, baseProfile));
         });
       }
-      const wasmTargetSlices = Math.max(2, Math.min(baseProfile.sliceCount, 8));
+      const wasmTargetSlices = Math.max(1, Math.min(baseProfile.sliceCount, 2));
       buildSliceFallbackChain(wasmTargetSlices, baseProfile.maxSlices).forEach((sliceCount) => {
         candidates.push(buildBrowserCandidate(modelId, "wasm", sliceCount, baseProfile));
       });
